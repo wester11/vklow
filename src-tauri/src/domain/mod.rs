@@ -1,5 +1,5 @@
 use serde::Serialize;
-#[derive(Clone, Debug, Serialize)] #[serde(rename_all = "lowercase")] pub enum Protocol { Vless, Vmess, Shadowsocks, Trojan }
+#[derive(Clone, Copy, Debug, Serialize)] #[serde(rename_all = "lowercase")] pub enum Protocol { Vless, Vmess, Shadowsocks, Trojan }
 #[derive(Clone, Debug, Serialize)] #[serde(rename_all = "SCREAMING_SNAKE_CASE")] pub enum ServerHealth { Unknown, Testing, Available, Degraded, Unavailable }
 #[derive(Clone, Debug, Serialize)] #[serde(rename_all = "camelCase")] pub struct ServerSummary { pub id: String, pub name: String, pub protocol: Protocol, pub address: String, pub port: u16, pub transport: Option<String>, pub country: Option<String>, pub health: ServerHealth, pub latency_ms: Option<u32> }
 #[derive(Clone, Debug)] pub struct Server { pub summary: ServerSummary, pub credential: String, pub security: Option<String>, pub sni: Option<String> }
