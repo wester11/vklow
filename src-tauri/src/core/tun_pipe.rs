@@ -31,6 +31,9 @@ pub struct TunPipeServer {
     handle: *mut c_void,
 }
 
+// A pipe server owns one Win32 handle and is moved once to its blocking accept worker.
+unsafe impl Send for TunPipeServer {}
+
 pub struct TunPipeConnection {
     file: File,
     peer_pid: u32,

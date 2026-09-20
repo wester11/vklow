@@ -18,6 +18,8 @@ pub struct TunRequest {
     pub protocol_version: u8,
     pub session_id: String,
     pub nonce: String,
+    pub controller_pid: u32,
+    pub helper_pid: u32,
     pub operation: TunOperation,
 }
 
@@ -41,6 +43,9 @@ impl TunRequest {
         if request.nonce != expected_nonce {
             return Err("Tun IPC nonce mismatch".into());
         }
+        if request.controller_pid == 0 || request.helper_pid == 0 {
+            return Err("Invalid TUN IPC process identity".into());
+        }
         Ok(request)
     }
 }
@@ -50,25 +55,41 @@ impl TunRequest {
 pub struct TunResponse {
     pub protocol_version: u8,
     pub session_id: String,
+    pub controller_pid: u32,
+    pub helper_pid: u32,
     pub ok: bool,
     pub state: String,
     pub message: Option<String>,
 }
 
 impl TunResponse {
-    pub fn accepted(session_id: String, state: impl Into<String>) -> Self {
+    pub fn accepted(
+        session_id: String,
+        controller_pid: u32,
+        helper_pid: u32,
+        state: impl Into<String>,
+    ) -> Self {
         Self {
             protocol_version: IPC_PROTOCOL_VERSION,
             session_id,
+            controller_pid,
+            helper_pid,
             ok: true,
             state: state.into(),
             message: None,
         }
     }
-    pub fn rejected(session_id: String, message: impl Into<String>) -> Self {
+    pub fn rejected(
+        session_id: String,
+        controller_pid: u32,
+        helper_pid: u32,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             protocol_version: IPC_PROTOCOL_VERSION,
             session_id,
+            controller_pid,
+            helper_pid,
             ok: false,
             state: "rejected".into(),
             message: Some(message.into()),
@@ -88,6 +109,8 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             session_id: SESSION.into(),
             nonce: NONCE.into(),
+            controller_pid: 42,
+            helper_pid: 43,
             operation,
         })
         .unwrap()
