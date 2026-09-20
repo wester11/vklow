@@ -2,11 +2,13 @@ mod core;
 mod domain;
 mod subscription;
 use chrono::Utc;
+use core::xray::manager::{CoreStatus, XrayCoreManager};
 use domain::{AppSnapshot, ConnectionState, Server, Subscription};
 use std::sync::Mutex;
-use tauri::State;
+use tauri::{Manager, State};
 use url::Url;
 use uuid::Uuid;
+
 struct RuntimeState {
     servers: Vec<Server>,
     subscriptions: Vec<Subscription>,
@@ -23,7 +25,10 @@ impl Default for RuntimeState {
         }
     }
 }
-struct AppState(Mutex<RuntimeState>);
+struct AppState {
+    runtime: Mutex<RuntimeState>,
+    core: XrayCoreManager,
+}
 fn snapshot(runtime: &RuntimeState) -> AppSnapshot {
     AppSnapshot {
         connection: runtime.connection.clone(),
@@ -38,8 +43,15 @@ fn snapshot(runtime: &RuntimeState) -> AppSnapshot {
 }
 #[tauri::command]
 fn get_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, String> {
-    let runtime = state.0.lock().map_err(|_| "Внутренняя ошибка состояния")?;
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния")?;
     Ok(snapshot(&runtime))
+}
+#[tauri::command]
+fn get_core_status(state: State<'_, AppState>) -> CoreStatus {
+    state.core.status()
 }
 #[tauri::command]
 async fn add_subscription(url: String, state: State<'_, AppState>) -> Result<ImportResult, String> {
@@ -50,7 +62,10 @@ async fn add_subscription(url: String, state: State<'_, AppState>) -> Result<Imp
         .to_owned();
     let servers = subscription::fetch_and_parse(&url).await?;
     let count = servers.len();
-    let mut runtime = state.0.lock().map_err(|_| "Внутренняя ошибка состояния")?;
+    let mut runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния")?;
     runtime.servers.extend(servers);
     runtime.subscriptions.push(Subscription {
         id: Uuid::new_v4().to_string(),
@@ -65,7 +80,10 @@ async fn add_subscription(url: String, state: State<'_, AppState>) -> Result<Imp
 #[tauri::command]
 fn import_uri(uri: String, state: State<'_, AppState>) -> Result<ImportResult, String> {
     let server = subscription::parser::parse_uri(uri.trim())?;
-    let mut runtime = state.0.lock().map_err(|_| "Внутренняя ошибка состояния")?;
+    let mut runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния")?;
     runtime.servers.push(server);
     runtime.subscriptions.push(Subscription {
         id: Uuid::new_v4().to_string(),
@@ -77,7 +95,10 @@ fn import_uri(uri: String, state: State<'_, AppState>) -> Result<ImportResult, S
 }
 #[tauri::command]
 fn select_server(server_id: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
-    let mut runtime = state.0.lock().map_err(|_| "Внутренняя ошибка состояния")?;
+    let mut runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния")?;
     if let Some(id) = &server_id {
         if !runtime
             .servers
@@ -92,19 +113,35 @@ fn select_server(server_id: Option<String>, state: State<'_, AppState>) -> Resul
 }
 #[tauri::command]
 fn connect(state: State<'_, AppState>) -> Result<(), String> {
-    let mut runtime = state.0.lock().map_err(|_| "Внутренняя ошибка состояния")?;
+    let mut runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния")?;
     if runtime.servers.is_empty() {
         return Err("Сначала добавьте подписку или URI сервера".into());
     }
-    runtime.connection = ConnectionState::Preparing;
+    if !matches!(
+        state.core.status().install_state,
+        core::xray::manager::CoreInstallState::Ready
+    ) {
+        runtime.connection = ConnectionState::Error {
+            message: "VPN-ядро не установлено".into(),
+        };
+        return Err(
+            "VPN-ядро не установлено. Установите проверенный Xray-core перед подключением.".into(),
+        );
+    }
     runtime.connection = ConnectionState::Error {
-        message: "Xray-core ещё не установлен в доверенное хранилище приложения".into(),
+        message: "Core installation готова, но запуск процесса ещё не реализован".into(),
     };
-    Err("Xray-core не установлен. Подключение не имитируется: добавьте проверенный core через менеджер обновлений.".into())
+    Err("Запуск Xray process manager ещё не реализован; подключение не имитируется.".into())
 }
 #[tauri::command]
 fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
-    let mut runtime = state.0.lock().map_err(|_| "Внутренняя ошибка состояния")?;
+    let mut runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния")?;
     runtime.connection = ConnectionState::Idle;
     Ok(())
 }
@@ -117,9 +154,20 @@ struct ImportResult {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState(Mutex::new(RuntimeState::default())))
+        .setup(|app| {
+            let data = app
+                .path()
+                .app_data_dir()
+                .map_err(|_| "Не удалось определить application data directory")?;
+            app.manage(AppState {
+                runtime: Mutex::new(RuntimeState::default()),
+                core: XrayCoreManager::load(data),
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            get_core_status,
             add_subscription,
             import_uri,
             select_server,
