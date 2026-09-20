@@ -2,6 +2,7 @@ pub mod core;
 pub mod domain;
 mod subscription;
 use chrono::Utc;
+use core::secrets::{subscription_url_key, SecretStore, WindowsSecretStore};
 use core::xray::manager::{CoreStatus, XrayCoreManager};
 use domain::{AppSnapshot, ConnectionState, Server, Subscription};
 use std::sync::Mutex;
@@ -28,6 +29,7 @@ impl Default for RuntimeState {
 struct AppState {
     runtime: Mutex<RuntimeState>,
     core: XrayCoreManager,
+    secrets: Box<dyn SecretStore>,
 }
 fn snapshot(runtime: &RuntimeState) -> AppSnapshot {
     AppSnapshot {
@@ -70,13 +72,15 @@ async fn add_subscription(url: String, state: State<'_, AppState>) -> Result<Imp
         .to_owned();
     let servers = subscription::fetch_and_parse(&url).await?;
     let count = servers.len();
+    let id = Uuid::new_v4().to_string();
+    state.secrets.set(&subscription_url_key(&id), &url)?;
     let mut runtime = state
         .runtime
         .lock()
         .map_err(|_| "Внутренняя ошибка состояния")?;
     runtime.servers.extend(servers);
     runtime.subscriptions.push(Subscription {
-        id: Uuid::new_v4().to_string(),
+        id,
         name,
         updated_at: Utc::now().to_rfc3339(),
         server_count: count,
@@ -173,6 +177,7 @@ pub fn run() {
             app.manage(AppState {
                 runtime: Mutex::new(RuntimeState::default()),
                 core: XrayCoreManager::load(data),
+                secrets: Box::new(WindowsSecretStore::new()),
             });
             Ok(())
         })
