@@ -70,7 +70,7 @@ impl TunPipeServer {
                 &attributes,
             )
         };
-        unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor as *mut c_void) };
+        unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor) };
         if handle == INVALID_HANDLE_VALUE {
             return Err("Unable to create restricted TUN pipe".into());
         }
@@ -83,7 +83,7 @@ impl TunPipeServer {
             unsafe { CloseHandle(self.handle) };
             return Err("TUN helper did not connect to pipe".into());
         }
-        let file = unsafe { File::from_raw_handle(self.handle as *mut c_void) };
+        let file = unsafe { File::from_raw_handle(self.handle) };
         Ok(TunPipeConnection { file })
     }
 }
@@ -105,7 +105,7 @@ impl TunPipeConnection {
         if handle == INVALID_HANDLE_VALUE {
             return Err("Unable to connect to restricted TUN pipe".into());
         }
-        let file = unsafe { File::from_raw_handle(handle as *mut c_void) };
+        let file = unsafe { File::from_raw_handle(handle) };
         Ok(Self { file })
     }
 
