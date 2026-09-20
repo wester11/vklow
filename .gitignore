@@ -26,6 +26,7 @@ diagnostics/
 *.diagnostic*
 *.dmp
 *.dump
+.tmp-xray-smoke/
 
 # Native build output
 src-tauri/target/
