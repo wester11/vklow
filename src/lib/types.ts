@@ -5,3 +5,4 @@ export interface ServerSummary { id: string; name: string; protocol: Protocol; a
 export interface Subscription { id: string; name: string; updatedAt: string; serverCount: number; }
 export interface AppSnapshot { connection: ConnectionState; servers: ServerSummary[]; subscriptions: Subscription[]; selectedServerId: string | null; }
 export interface ImportResult { serverCount: number; }
+export interface CoreStatus { installState: "not_installed" | "ready" | "failed"; activeVersion?: string; previousVersion?: string; lastError?: string; }
