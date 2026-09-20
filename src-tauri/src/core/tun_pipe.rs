@@ -17,7 +17,8 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, PIPE_ACCESS_DUPLEX},
     System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
+        GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
         PIPE_TYPE_BYTE, PIPE_WAIT,
     },
 };
@@ -32,6 +33,7 @@ pub struct TunPipeServer {
 
 pub struct TunPipeConnection {
     file: File,
+    peer_pid: u32,
 }
 
 impl TunPipeServer {
@@ -83,8 +85,13 @@ impl TunPipeServer {
             unsafe { CloseHandle(self.handle) };
             return Err("TUN helper did not connect to pipe".into());
         }
+        let mut peer_pid = 0;
+        if unsafe { GetNamedPipeClientProcessId(self.handle, &mut peer_pid) } == 0 || peer_pid == 0
+        {
+            return Err("Unable to verify TUN helper pipe process".into());
+        }
         let file = unsafe { File::from_raw_handle(self.handle) };
-        Ok(TunPipeConnection { file })
+        Ok(TunPipeConnection { file, peer_pid })
     }
 }
 
@@ -105,8 +112,13 @@ impl TunPipeConnection {
         if handle == INVALID_HANDLE_VALUE {
             return Err("Unable to connect to restricted TUN pipe".into());
         }
+        let mut peer_pid = 0;
+        if unsafe { GetNamedPipeServerProcessId(handle, &mut peer_pid) } == 0 || peer_pid == 0 {
+            unsafe { CloseHandle(handle) };
+            return Err("Unable to verify TUN controller pipe process".into());
+        }
         let file = unsafe { File::from_raw_handle(handle) };
-        Ok(Self { file })
+        Ok(Self { file, peer_pid })
     }
 
     pub fn write_frame(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -139,6 +151,9 @@ impl TunPipeConnection {
     pub fn into_file(self) -> File {
         self.file
     }
+    pub fn peer_pid(&self) -> u32 {
+        self.peer_pid
+    }
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -161,10 +176,12 @@ mod tests {
         let client_name = name.clone();
         let client = std::thread::spawn(move || {
             let mut connection = TunPipeConnection::connect(&client_name).unwrap();
+            assert_ne!(connection.peer_pid(), 0);
             connection.write_frame(b"request").unwrap();
             assert_eq!(connection.read_frame().unwrap(), b"response");
         });
         let mut connection = server.accept().unwrap();
+        assert_ne!(connection.peer_pid(), 0);
         assert_eq!(connection.read_frame().unwrap(), b"request");
         connection.write_frame(b"response").unwrap();
         client.join().unwrap();
