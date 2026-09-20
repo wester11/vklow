@@ -1,6 +1,6 @@
 # Windows TUN: first safety milestone
 
-VOID uses native Xray TUN rather than an external tun2socks process. The selected stable Xray `v26.3.27` release includes the required official `wintun.dll`; Xray requires that DLL next to `xray.exe` on Windows.
+VOID uses native Xray TUN rather than an external tun2socks process. TUN installs resolve the first non-draft, non-prerelease release returned by the official XTLS release list; `v26.3.27` is deliberately not a routing baseline because Windows routing support landed upstream after that release. The selected stable release must include the official `wintun.dll`; Xray requires that DLL next to `xray.exe` on Windows.
 
 Before any TUN session, VOID validates a typed minimal TUN configuration through `xray run -test` and checks that exact runtime component. The probe does not create an adapter, add routes, or change DNS.
 

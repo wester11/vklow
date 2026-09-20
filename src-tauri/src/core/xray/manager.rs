@@ -16,7 +16,7 @@ use std::{
     collections::VecDeque,
     fs,
     io::{BufRead, BufReader},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -442,26 +442,37 @@ impl XrayCoreManager {
             .parse()
             .map_err(|_| "Некорректный loopback port")?;
         loop {
-            let runtime = self
-                .runtime
-                .lock()
-                .map_err(|_| "Внутренняя ошибка Xray runtime")?;
-            if runtime.generation != gen {
-                return Err("Подключение было отменено".into());
-            }
-            let process = runtime
-                .process
-                .as_ref()
-                .ok_or("Xray process потерян до readiness")?;
-            let exited = process
-                .child
-                .lock()
-                .map_err(|_| "Внутренняя ошибка owned Xray process")?
-                .try_wait()
-                .map_err(|_| "Не удалось проверить Xray process")?;
-            drop(runtime);
+            let (exited, tail) = {
+                let runtime = self
+                    .runtime
+                    .lock()
+                    .map_err(|_| "Внутренняя ошибка Xray runtime")?;
+                if runtime.generation != gen {
+                    return Err("Подключение было отменено".into());
+                }
+                let process = runtime
+                    .process
+                    .as_ref()
+                    .ok_or("Xray process потерян до readiness")?;
+                let exited = process
+                    .child
+                    .lock()
+                    .map_err(|_| "Внутренняя ошибка owned Xray process")?
+                    .try_wait()
+                    .map_err(|_| "Не удалось проверить Xray process")?;
+                (exited, Arc::clone(&process.tail))
+            };
             if let Some(status) = exited {
-                return Err(format!("Xray завершился до readiness: {status}"));
+                let detail = tail
+                    .lock()
+                    .ok()
+                    .and_then(|tail| tail.back().cloned())
+                    .unwrap_or_default();
+                return Err(if detail.is_empty() {
+                    format!("Xray завершился до readiness: {status}")
+                } else {
+                    format!("Xray завершился до readiness: {status}; {detail}")
+                });
             }
             if TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok() {
                 return Ok(());
@@ -530,12 +541,18 @@ impl XrayCoreManager {
         }
     }
     fn allocate_port() -> Result<u16, String> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|_| "Не удалось выделить loopback SOCKS port")?;
-        listener
-            .local_addr()
-            .map(|a| a.port())
-            .map_err(|_| "Не удалось определить loopback SOCKS port".into())
+        for _ in 0..32 {
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .map_err(|_| "Не удалось выделить loopback SOCKS port")?;
+            let port = listener
+                .local_addr()
+                .map_err(|_| "Не удалось определить loopback SOCKS port")?
+                .port();
+            if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                return Ok(port);
+            }
+        }
+        Err("Не удалось выделить loopback SOCKS TCP/UDP port".into())
     }
     fn set_state(&self, gen: u64, connection: ConnectionState) -> Result<(), String> {
         let mut runtime = self

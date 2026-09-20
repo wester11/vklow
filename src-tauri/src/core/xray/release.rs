@@ -12,7 +12,7 @@ use std::{
 };
 use url::Url;
 
-const API: &str = "https://api.github.com/repos/XTLS/Xray-core/releases/latest";
+const API: &str = "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=20";
 pub const ARCHIVE_NAME: &str = "Xray-windows-64.zip";
 pub const DIGEST_NAME: &str = "Xray-windows-64.zip.dgst";
 const MAX_ARCHIVE: u64 = 64 * 1024 * 1024;
@@ -25,12 +25,14 @@ pub struct OfficialRelease {
     pub digest: Url,
     pub asset_name: String,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct GithubRelease {
     tag_name: String,
+    draft: bool,
+    prerelease: bool,
     assets: Vec<GithubAsset>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct GithubAsset {
     name: String,
     browser_download_url: String,
@@ -48,9 +50,11 @@ pub fn resolve_windows_x64(client: &Client) -> Result<OfficialRelease, String> {
     if !response.status().is_success() {
         return Err("Официальный Xray release недоступен".into());
     }
-    let release: GithubRelease = response
+    let releases: Vec<GithubRelease> = response
         .json()
         .map_err(|_| "Некорректный ответ официального Xray release API")?;
+    let release =
+        select_stable_release(releases).ok_or("Официальный stable Xray release недоступен")?;
     let version = release.tag_name.parse()?;
     let asset = |name: &str| -> Result<Url, String> {
         let item = release
@@ -66,6 +70,12 @@ pub fn resolve_windows_x64(client: &Client) -> Result<OfficialRelease, String> {
         digest: asset(DIGEST_NAME)?,
         asset_name: ARCHIVE_NAME.into(),
     })
+}
+
+fn select_stable_release(releases: Vec<GithubRelease>) -> Option<GithubRelease> {
+    releases
+        .into_iter()
+        .find(|release| !release.draft && !release.prerelease)
 }
 pub fn trusted_client() -> Result<Client, String> {
     Client::builder()
@@ -152,4 +162,39 @@ fn trusted_host(host: Option<&str>) -> bool {
                 | "release-assets.githubusercontent.com"
         )
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn release(tag_name: &str, draft: bool, prerelease: bool) -> GithubRelease {
+        GithubRelease {
+            tag_name: tag_name.into(),
+            draft,
+            prerelease,
+            assets: vec![],
+        }
+    }
+
+    #[test]
+    fn selects_first_non_draft_non_prerelease() {
+        let selected = select_stable_release(vec![
+            release("v26.10.1", false, true),
+            release("v26.10.0", true, false),
+            release("v26.9.8", false, false),
+        ])
+        .expect("stable release");
+
+        assert_eq!(selected.tag_name, "v26.9.8");
+    }
+
+    #[test]
+    fn rejects_release_list_without_stable_entry() {
+        assert!(select_stable_release(vec![
+            release("v26.10.1", false, true),
+            release("v26.10.0", true, false),
+        ])
+        .is_none());
+    }
 }
