@@ -1,4 +1,5 @@
 mod domain;
+mod core;
 mod subscription;
 use std::sync::Mutex; use chrono::Utc; use tauri::State; use url::Url; use uuid::Uuid; use domain::{AppSnapshot, ConnectionState, Server, Subscription};
 struct RuntimeState { servers: Vec<Server>, subscriptions: Vec<Subscription>, selected_server_id: Option<String>, connection: ConnectionState }

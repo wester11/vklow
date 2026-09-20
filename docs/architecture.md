@@ -10,6 +10,7 @@ Windows desktop client using Tauri 2, Rust and React/TypeScript. The first imple
 | --- | --- |
 | `src/` | Presentation, localized UI state and typed Tauri calls. No subscription secrets or Xray invocation. |
 | `src-tauri/subscription` | HTTPS retrieval limits, base64 subscription decoding and URI parsing. |
+| `src-tauri/core/xray` | Version validation, integrity, typed config generation and diagnostic redaction. |
 | `src-tauri/domain` | Normalized `Server`, serializable redacted `ServerSummary`, subscription and state-machine data. |
 | `src-tauri/core` | Reserved for Xray lifecycle, validated config generation, stdout/stderr redaction and rollback. |
 | `src-tauri/storage` | Reserved for versioned normal settings and Windows secure secret storage. |
