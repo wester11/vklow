@@ -12,6 +12,7 @@ pub struct TunInboundSettings {
 }
 #[derive(Serialize)]
 struct TunInbound {
+    port: u16,
     protocol: &'static str,
     settings: TunInboundSettings,
 }
@@ -61,6 +62,7 @@ pub fn loopback_freedom_socks(socks_port: u16) -> serde_json::Value {
 pub fn tun_capability_config() -> Result<serde_json::Value, String> {
     serde_json::to_value(TunValidationConfig {
         inbounds: vec![TunInbound {
+            port: 0,
             protocol: "tun",
             settings: TunInboundSettings {
                 name: "VOID Capability Probe".into(),
@@ -89,6 +91,7 @@ pub fn scoped_tun_smoke_config(adapter_name: &str) -> Result<serde_json::Value, 
     }
     serde_json::to_value(TunValidationConfig {
         inbounds: vec![TunInbound {
+            port: 0,
             protocol: "tun",
             settings: TunInboundSettings {
                 name: adapter_name.into(),

@@ -3,6 +3,7 @@ use void_desktop_lib::core::{
     tun_launcher::{launch_elevated_helper, ElevationError},
     tun_pipe::TunPipeServer,
     tun_protocol::{TunOperation, TunRequest, TunResponse, IPC_PROTOCOL_VERSION},
+    xray::manager::XrayCoreManager,
 };
 
 const HELPER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -19,6 +20,14 @@ fn main() {
 }
 
 fn run() -> Result<String, ElevationError> {
+    let app_data = env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .ok_or(ElevationError::LaunchFailed)?
+        .join("com.void.desktop");
+    let baseline = https_check().map_err(|_| ElevationError::LaunchFailed)?;
+    let core = XrayCoreManager::load(app_data);
+    core.install_pinned_experimental_tun()
+        .map_err(|_| ElevationError::LaunchFailed)?;
     let controller_pid = process::id();
     let session_id = uuid::Uuid::new_v4().to_string();
     let nonce = format!(
@@ -76,8 +85,51 @@ fn run() -> Result<String, ElevationError> {
     {
         return Err(ElevationError::LaunchFailed);
     }
+    if response.state != "scoped_tun_running" {
+        return Err(ElevationError::LaunchFailed);
+    }
+    let through_tun = https_check().map_err(|_| ElevationError::LaunchFailed)?;
+    let stop = TunRequest {
+        protocol_version: IPC_PROTOCOL_VERSION,
+        session_id: session_id.clone(),
+        nonce: request.nonce,
+        controller_pid,
+        helper_pid,
+        operation: TunOperation::StopTunSession,
+    };
+    pipe.write_frame(&serde_json::to_vec(&stop).map_err(|_| ElevationError::LaunchFailed)?)
+        .map_err(|_| ElevationError::LaunchFailed)?;
+    let stopped: TunResponse = serde_json::from_slice(
+        &pipe
+            .read_frame()
+            .map_err(|_| ElevationError::LaunchFailed)?,
+    )
+    .map_err(|_| ElevationError::LaunchFailed)?;
+    if !stopped.ok || stopped.state != "stopped" || stopped.helper_pid != helper_pid {
+        return Err(ElevationError::LaunchFailed);
+    }
+    let after = https_check().map_err(|_| ElevationError::LaunchFailed)?;
     Ok(format!(
-        "UAC handshake verified: controller_pid={controller_pid} helper_pid={helper_pid} pipe_client_pid={} pipe_server_pid={controller_pid}",
-        pipe.peer_pid()
+        "Scoped TUN smoke: controller_pid={controller_pid} helper_pid={helper_pid} pipe_client_pid={} pipe_server_pid={controller_pid} https_before={baseline} https_tun={through_tun} https_after={after}",
+        pipe.peer_pid(),
     ))
+}
+
+fn https_check() -> Result<u16, String> {
+    let response = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|_| "Unable to prepare direct HTTPS client")?
+        .get("https://1.1.1.1/help")
+        .send()
+        .map_err(|_| "SmokePreconditionFailed")?;
+    let status = response.status().as_u16();
+    if response
+        .content_length()
+        .is_some_and(|length| length > 64 * 1024)
+    {
+        return Err("HTTPS response exceeds smoke limit".into());
+    }
+    Ok(status)
 }

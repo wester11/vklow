@@ -139,6 +139,12 @@ impl XrayCoreManager {
     pub fn diagnostics_directory(&self) -> PathBuf {
         self.paths.root().join("diagnostics")
     }
+    pub fn tun_journal_path(&self) -> PathBuf {
+        self.paths.root().join("tun-session.json")
+    }
+    pub fn runtime_directory(&self) -> PathBuf {
+        self.paths.runtime()
+    }
     pub fn validate_tun_capability(&self) -> TunCapabilityStatus {
         self.validate_tun_capability_for(XrayReleaseChannel::Stable)
     }
