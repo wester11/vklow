@@ -31,3 +31,14 @@ jobs:
       - run: cargo test --manifest-path src-tauri/Cargo.toml
       - run: pnpm build
       - run: pnpm tauri build --debug
+  xray-integration:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --manifest-path src-tauri/Cargo.toml real_xray_socks_reconnects_when_verified_fixture_is_supplied -- --nocapture
+        env:
+          VOID_XRAY_INTEGRATION: "1"
+      - run: cargo test --manifest-path src-tauri/Cargo.toml managed_xray_crash_is_detected_when_verified_fixture_is_supplied -- --nocapture
+        env:
+          VOID_XRAY_INTEGRATION: "1"

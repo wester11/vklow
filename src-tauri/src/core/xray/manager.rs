@@ -573,26 +573,12 @@ mod tests {
     }
     #[test]
     fn real_xray_socks_reconnects_when_verified_fixture_is_supplied() {
-        let Some(archive) = std::env::var_os("VOID_XRAY_TEST_ARCHIVE") else {
-            return;
-        };
-        let Some(digest) = std::env::var_os("VOID_XRAY_TEST_DIGEST") else {
-            return;
-        };
-        let version: XrayVersion = std::env::var("VOID_XRAY_TEST_VERSION")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .expect("VOID_XRAY_TEST_VERSION must be an Xray version");
         let root =
             std::env::temp_dir().join(format!("void-xray-integration-{}", uuid::Uuid::new_v4()));
         let manager = XrayCoreManager::load(root.clone());
-        manager
-            .install_verified_core(
-                Path::new(&archive),
-                &fs::read_to_string(digest).unwrap(),
-                version,
-            )
-            .unwrap();
+        if !install_test_core(&manager) {
+            return;
+        }
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let origin = listener.local_addr().unwrap();
         let token = format!("void-{}", uuid::Uuid::new_v4());
@@ -649,25 +635,11 @@ mod tests {
     }
     #[test]
     fn managed_xray_crash_is_detected_when_verified_fixture_is_supplied() {
-        let Some(archive) = std::env::var_os("VOID_XRAY_TEST_ARCHIVE") else {
-            return;
-        };
-        let Some(digest) = std::env::var_os("VOID_XRAY_TEST_DIGEST") else {
-            return;
-        };
-        let version: XrayVersion = std::env::var("VOID_XRAY_TEST_VERSION")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .expect("VOID_XRAY_TEST_VERSION must be an Xray version");
         let root = std::env::temp_dir().join(format!("void-xray-crash-{}", uuid::Uuid::new_v4()));
         let manager = XrayCoreManager::load(root);
-        manager
-            .install_verified_core(
-                Path::new(&archive),
-                &fs::read_to_string(digest).unwrap(),
-                version,
-            )
-            .unwrap();
+        if !install_test_core(&manager) {
+            return;
+        }
         manager.connect_freedom_for_test().unwrap();
         manager.terminate_owned_process_for_test().unwrap();
         for _ in 0..30 {
@@ -680,5 +652,31 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
         }
         panic!("Xray crash watcher did not update connection state");
+    }
+    fn install_test_core(manager: &XrayCoreManager) -> bool {
+        if std::env::var_os("VOID_XRAY_INTEGRATION").is_some() {
+            manager
+                .install_latest_official()
+                .expect("official verified Xray installation failed");
+            return true;
+        }
+        let (Some(archive), Some(digest)) = (
+            std::env::var_os("VOID_XRAY_TEST_ARCHIVE"),
+            std::env::var_os("VOID_XRAY_TEST_DIGEST"),
+        ) else {
+            return false;
+        };
+        let version: XrayVersion = std::env::var("VOID_XRAY_TEST_VERSION")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .expect("VOID_XRAY_TEST_VERSION must be an Xray version");
+        manager
+            .install_verified_core(
+                Path::new(&archive),
+                &fs::read_to_string(digest).expect("test digest must be readable"),
+                version,
+            )
+            .expect("verified fixture installation failed");
+        true
     }
 }
