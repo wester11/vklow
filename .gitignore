@@ -12,6 +12,24 @@ dist
 dist-ssr
 *.local
 
+# Local secrets and private runtime state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+runtime/
+runtime-configs/
+diagnostics/
+*.diagnostic*
+*.dmp
+*.dump
+
+# Native build output
+src-tauri/target/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
