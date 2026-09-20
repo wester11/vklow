@@ -98,16 +98,33 @@ pub fn ipv4_routes() -> Result<Vec<Ipv4Route>, String> {
 fn route_from_row(row: &MIB_IPFORWARD_ROW2) -> Ipv4Route {
     let raw = unsafe { row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr };
     Ipv4Route {
-        destination: raw.to_be_bytes(),
+        // `S_addr` is stored in network byte order in memory. Converting the
+        // integer with native bytes preserves that wire-order address on LE Windows.
+        destination: raw.to_ne_bytes(),
         prefix_length: row.DestinationPrefix.PrefixLength,
         interface_index: row.InterfaceIndex,
     }
 }
 
 pub fn scoped_smoke_route() -> Result<Option<Ipv4Route>, String> {
+    ipv4_route([1, 1, 1, 1], 32)
+}
+
+pub fn ipv4_route(destination: [u8; 4], prefix_length: u8) -> Result<Option<Ipv4Route>, String> {
     Ok(ipv4_routes()?
         .into_iter()
-        .find(|route| route.destination == [1, 1, 1, 1] && route.prefix_length == 32))
+        .find(|route| route.destination == destination && route.prefix_length == prefix_length))
+}
+
+pub fn full_ipv4_routes() -> Result<[Option<Ipv4Route>; 2], String> {
+    Ok([ipv4_route([0, 0, 0, 0], 1)?, ipv4_route([128, 0, 0, 0], 1)?])
+}
+
+pub fn physical_default_routes() -> Result<Vec<Ipv4Route>, String> {
+    Ok(ipv4_routes()?
+        .into_iter()
+        .filter(|route| route.destination == [0, 0, 0, 0] && route.prefix_length == 0)
+        .collect())
 }
 
 pub fn has_default_route_on(interface_index: u32) -> Result<bool, String> {
@@ -155,6 +172,13 @@ pub fn physical_dns_snapshot() -> Result<PhysicalDnsSnapshot, String> {
         adapters: physical,
         void_tun_dns,
     })
+}
+
+pub fn void_tun_adapters() -> Result<Vec<PhysicalAdapterDnsSnapshot>, String> {
+    Ok(read_adapter_dns()?
+        .into_iter()
+        .filter(|adapter| adapter.friendly_name.starts_with("VOID Tunnel "))
+        .collect())
 }
 
 /// A changed active uplink is an inconclusive smoke run, not evidence that

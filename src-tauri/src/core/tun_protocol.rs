@@ -7,9 +7,12 @@ pub const MAX_IPC_MESSAGE_BYTES: usize = 4096;
 #[serde(rename_all = "snake_case")]
 pub enum TunOperation {
     StartScopedTunSession,
+    StartFullIpv4Experimental,
     StopTunSession,
     QueryTunSession,
     RecoverTunSession,
+    /// Development controller only; the helper terminates its own tracked child.
+    TestCrashOwnedCore,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

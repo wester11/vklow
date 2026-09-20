@@ -79,6 +79,8 @@ pub fn tun_capability_config() -> Result<serde_json::Value, String> {
     .map_err(|_| "Не удалось сериализовать TUN capability config".into())
 }
 pub const SCOPED_SMOKE_ROUTE: &str = "1.1.1.1/32";
+pub const FULL_IPV4_ROUTES: [&str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
+pub const FULL_IPV4_TUN_DNS: [&str; 2] = ["1.1.1.1", "1.0.0.1"];
 
 pub fn scoped_tun_smoke_config(adapter_name: &str) -> Result<serde_json::Value, String> {
     if adapter_name.len() > 96
@@ -106,6 +108,42 @@ pub fn scoped_tun_smoke_config(adapter_name: &str) -> Result<serde_json::Value, 
         outbounds: vec![serde_json::json!({"tag":"direct","protocol":"freedom"})],
     })
     .map_err(|_| "Не удалось сериализовать scoped TUN config".into())
+}
+
+/// Development-only full IPv4 proof configuration. The two /1 routes retain
+/// the physical /0 as Xray's underlying uplink and deliberately add no IPv6.
+pub fn full_ipv4_freedom_config(adapter_name: &str) -> Result<serde_json::Value, String> {
+    if adapter_name.len() > 96
+        || adapter_name.is_empty()
+        || !adapter_name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, ' ' | '-'))
+    {
+        return Err("Недопустимое имя VOID TUN adapter".into());
+    }
+    serde_json::to_value(TunValidationConfig {
+        inbounds: vec![TunInbound {
+            port: 0,
+            protocol: "tun",
+            settings: TunInboundSettings {
+                name: adapter_name.into(),
+                desc: "VOID Experimental Full IPv4 TUN".into(),
+                mtu: 1500,
+                gateway: vec!["198.18.0.1/30".into()],
+                dns: FULL_IPV4_TUN_DNS
+                    .iter()
+                    .map(|value| (*value).into())
+                    .collect(),
+                auto_system_routing_table: FULL_IPV4_ROUTES
+                    .iter()
+                    .map(|value| (*value).into())
+                    .collect(),
+                auto_outbounds_interface: "auto".into(),
+            },
+        }],
+        outbounds: vec![serde_json::json!({"tag":"direct","protocol":"freedom"})],
+    })
+    .map_err(|_| "Не удалось сериализовать full IPv4 TUN config".into())
 }
 #[cfg(test)]
 mod tests {
@@ -147,6 +185,21 @@ mod tests {
             settings["autoSystemRoutingTable"],
             serde_json::json!([SCOPED_SMOKE_ROUTE])
         );
+        assert_eq!(settings["autoOutboundsInterface"], "auto");
+        assert_ne!(
+            settings["autoSystemRoutingTable"],
+            serde_json::json!(["0.0.0.0/0"])
+        );
+    }
+    #[test]
+    fn full_ipv4_policy_uses_only_the_two_fail_open_routes() {
+        let value = full_ipv4_freedom_config("VOID Tunnel 1234").unwrap();
+        let settings = &value["inbounds"][0]["settings"];
+        assert_eq!(
+            settings["autoSystemRoutingTable"],
+            serde_json::json!(FULL_IPV4_ROUTES)
+        );
+        assert_eq!(settings["dns"], serde_json::json!(FULL_IPV4_TUN_DNS));
         assert_eq!(settings["autoOutboundsInterface"], "auto");
         assert_ne!(
             settings["autoSystemRoutingTable"],

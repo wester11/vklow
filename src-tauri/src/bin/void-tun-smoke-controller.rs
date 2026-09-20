@@ -1,9 +1,11 @@
-use std::{env, process, sync::mpsc, thread, time::Duration};
+use std::{env, net::ToSocketAddrs, process, sync::mpsc, thread, time::Duration};
 use void_desktop_lib::core::{
     network::{
-        compare_physical_dns, has_default_route_on, interface_metadata, physical_dns_snapshot,
-        scoped_smoke_route, PhysicalDnsComparison, PhysicalDnsSnapshot,
+        compare_physical_dns, full_ipv4_routes, has_default_route_on, interface_metadata,
+        physical_default_routes, physical_dns_snapshot, scoped_smoke_route, void_tun_adapters,
+        PhysicalDnsComparison, PhysicalDnsSnapshot,
     },
+    tun::TunSessionJournal,
     tun_launcher::{launch_elevated_helper, ElevationError},
     tun_pipe::{TunPipeConnection, TunPipeServer},
     tun_protocol::{TunOperation, TunRequest, TunResponse, IPC_PROTOCOL_VERSION},
@@ -32,14 +34,30 @@ fn run() -> Result<String, ElevationError> {
         && env::args()
             .skip(1)
             .any(|argument| argument == "--abort-after-route");
+    let full_ipv4 = env::args()
+        .skip(1)
+        .any(|argument| argument == "--full-ipv4");
+    let test_crash_core = cfg!(debug_assertions)
+        && env::args()
+            .skip(1)
+            .any(|argument| argument == "--crash-xray-after-route");
+    let test_crash_helper = cfg!(debug_assertions)
+        && env::args()
+            .skip(1)
+            .any(|argument| argument == "--crash-helper-after-route");
     let route_before = scoped_smoke_route().map_err(|_| ElevationError::LaunchFailed)?;
+    let full_routes_before = full_ipv4_routes().map_err(|_| ElevationError::LaunchFailed)?;
+    if full_ipv4 && full_routes_before.iter().any(Option::is_some) {
+        return Err(ElevationError::LaunchFailed);
+    }
     let dns_before = physical_dns_snapshot().map_err(|_| ElevationError::LaunchFailed)?;
     let app_data = env::var_os("APPDATA")
         .map(std::path::PathBuf::from)
         .ok_or(ElevationError::LaunchFailed)?
         .join("com.void.desktop");
     let baseline = https_check().map_err(|_| ElevationError::LaunchFailed)?;
-    let core = XrayCoreManager::load(app_data);
+    let hostname_baseline = https_hostname_check().map_err(|_| ElevationError::LaunchFailed)?;
+    let core = XrayCoreManager::load(app_data.clone());
     core.install_pinned_experimental_tun()
         .map_err(|_| ElevationError::LaunchFailed)?;
     let controller_pid = process::id();
@@ -82,7 +100,11 @@ fn run() -> Result<String, ElevationError> {
         nonce,
         controller_pid,
         helper_pid,
-        operation: TunOperation::StartScopedTunSession,
+        operation: if full_ipv4 {
+            TunOperation::StartFullIpv4Experimental
+        } else {
+            TunOperation::StartScopedTunSession
+        },
     };
     pipe.write_frame(&serde_json::to_vec(&request).map_err(|_| ElevationError::LaunchFailed)?)
         .map_err(|_| ElevationError::LaunchFailed)?;
@@ -97,14 +119,38 @@ fn run() -> Result<String, ElevationError> {
         || response.controller_pid != controller_pid
         || response.helper_pid != helper_pid
     {
+        if let Some(message) = response.message {
+            eprintln!("VOID TUN helper rejected typed session: {message}");
+        }
         return Err(ElevationError::LaunchFailed);
     }
-    if response.state != "scoped_tun_running" {
+    if response.state
+        != if full_ipv4 {
+            "full_ipv4_tun_running"
+        } else {
+            "scoped_tun_running"
+        }
+    {
         return Err(ElevationError::LaunchFailed);
     }
-    let route_during = scoped_smoke_route()
-        .map_err(|_| ElevationError::LaunchFailed)?
-        .ok_or(ElevationError::LaunchFailed)?;
+    let route_during = if full_ipv4 {
+        let [first, second] = full_ipv4_routes().map_err(|_| ElevationError::LaunchFailed)?;
+        let first = first.ok_or(ElevationError::LaunchFailed)?;
+        let second = second.ok_or(ElevationError::LaunchFailed)?;
+        if first.interface_index != second.interface_index
+            || physical_default_routes()
+                .map_err(|_| ElevationError::LaunchFailed)?
+                .iter()
+                .all(|route| route.interface_index == first.interface_index)
+        {
+            return Err(ElevationError::LaunchFailed);
+        }
+        first
+    } else {
+        scoped_smoke_route()
+            .map_err(|_| ElevationError::LaunchFailed)?
+            .ok_or(ElevationError::LaunchFailed)?
+    };
     if has_default_route_on(route_during.interface_index)
         .map_err(|_| ElevationError::LaunchFailed)?
     {
@@ -120,18 +166,83 @@ fn run() -> Result<String, ElevationError> {
         let _ = stop_session(&mut pipe, &request, &session_id, controller_pid, helper_pid);
         return Err(error);
     }
+    if test_crash_helper {
+        helper.terminate_if_owned();
+        drop(pipe);
+        thread::sleep(Duration::from_secs(3));
+        recover_stale_owned_journal(&app_data)?;
+        let full_after = full_ipv4_routes().map_err(|_| ElevationError::LaunchFailed)?;
+        if (full_ipv4 && full_after != full_routes_before)
+            || (!full_ipv4
+                && scoped_smoke_route().map_err(|_| ElevationError::LaunchFailed)? != route_before)
+        {
+            return Err(ElevationError::LaunchFailed);
+        }
+        let dns_after = physical_dns_snapshot().map_err(|_| ElevationError::LaunchFailed)?;
+        dns_equality_result(&dns_before, &dns_after)?;
+        let ip = https_check().map_err(|_| ElevationError::LaunchFailed)?;
+        return Ok(format!(
+            "Helper Job Object crash cleanup: full_ipv4={full_ipv4} full_routes_after={full_after:?} dns_after={} https_ip_after={ip}",
+            format_dns(&dns_after),
+        ));
+    }
+    if test_crash_core {
+        let crash = TunRequest {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            session_id: session_id.clone(),
+            nonce: request.nonce.clone(),
+            controller_pid,
+            helper_pid,
+            operation: TunOperation::TestCrashOwnedCore,
+        };
+        pipe.write_frame(&serde_json::to_vec(&crash).map_err(|_| ElevationError::LaunchFailed)?)
+            .map_err(|_| ElevationError::LaunchFailed)?;
+        let crashed: TunResponse = serde_json::from_slice(
+            &pipe
+                .read_frame()
+                .map_err(|_| ElevationError::LaunchFailed)?,
+        )
+        .map_err(|_| ElevationError::LaunchFailed)?;
+        if !crashed.ok || crashed.state != "owned_core_crash_recovered" {
+            return Err(ElevationError::LaunchFailed);
+        }
+        let full_after = full_ipv4_routes().map_err(|_| ElevationError::LaunchFailed)?;
+        if (full_ipv4 && full_after != full_routes_before)
+            || (!full_ipv4
+                && scoped_smoke_route().map_err(|_| ElevationError::LaunchFailed)? != route_before)
+        {
+            return Err(ElevationError::LaunchFailed);
+        }
+        let dns_after = physical_dns_snapshot().map_err(|_| ElevationError::LaunchFailed)?;
+        dns_equality_result(&dns_before, &dns_after)?;
+        let ip = https_check().map_err(|_| ElevationError::LaunchFailed)?;
+        let hostname = https_hostname_check().map_err(|_| ElevationError::LaunchFailed)?;
+        return Ok(format!(
+            "Owned Xray crash cleanup: mode={} full_routes_after={full_after:?} dns_before={} dns_during={} dns_after={} https_ip_after={ip} https_hostname_after={hostname}",
+            if full_ipv4 { "full_ipv4" } else { "scoped" },
+            format_dns(&dns_before),
+            format_dns(&dns_during),
+            format_dns(&dns_after),
+        ));
+    }
     if abort_after_route {
         drop(pipe);
         thread::sleep(Duration::from_secs(3));
         let route_after_abort = scoped_smoke_route().map_err(|_| ElevationError::LaunchFailed)?;
-        if route_after_abort != route_before {
+        let full_after_abort = full_ipv4_routes().map_err(|_| ElevationError::LaunchFailed)?;
+        if (!full_ipv4 && route_after_abort != route_before)
+            || (full_ipv4 && full_after_abort != full_routes_before)
+        {
             return Err(ElevationError::LaunchFailed);
         }
         let dns_after_abort = physical_dns_snapshot().map_err(|_| ElevationError::LaunchFailed)?;
         dns_equality_result(&dns_before, &dns_after_abort)?;
         let after_abort = https_check().map_err(|_| ElevationError::LaunchFailed)?;
+        let hostname_after_abort =
+            https_hostname_check().map_err(|_| ElevationError::LaunchFailed)?;
         return Ok(format!(
-            "Controlled failure cleanup: controller_pid={controller_pid} helper_pid={helper_pid} route_after={route_after_abort:?} dns_before={} dns_during={} dns_after={} void_tun_dns_during={} https_after={after_abort}",
+            "Controlled failure cleanup: mode={} controller_pid={controller_pid} helper_pid={helper_pid} route_after={route_after_abort:?} full_routes_after={full_after_abort:?} dns_before={} dns_during={} dns_after={} void_tun_dns_during={} https_after={after_abort} hostname_https_after={hostname_after_abort}",
+            if full_ipv4 { "full_ipv4" } else { "scoped" },
             format_dns(&dns_before),
             format_dns(&dns_during),
             format_dns(&dns_after_abort),
@@ -139,6 +250,8 @@ fn run() -> Result<String, ElevationError> {
         ));
     }
     let through_tun = https_check().map_err(|_| ElevationError::LaunchFailed)?;
+    let hostname_through_tun = https_hostname_check().map_err(|_| ElevationError::LaunchFailed)?;
+    let udp_resolution = system_dns_udp_check().map_err(|_| ElevationError::LaunchFailed)?;
     let interface_after = interface_metadata(route_during.interface_index)
         .map_err(|_| ElevationError::LaunchFailed)?;
     let stopped = stop_session(&mut pipe, &request, &session_id, controller_pid, helper_pid)?;
@@ -146,14 +259,19 @@ fn run() -> Result<String, ElevationError> {
         return Err(ElevationError::LaunchFailed);
     }
     let route_after = scoped_smoke_route().map_err(|_| ElevationError::LaunchFailed)?;
-    if route_after != route_before {
+    let full_routes_after = full_ipv4_routes().map_err(|_| ElevationError::LaunchFailed)?;
+    if (!full_ipv4 && route_after != route_before)
+        || (full_ipv4 && full_routes_after != full_routes_before)
+    {
         return Err(ElevationError::LaunchFailed);
     }
     let dns_after = physical_dns_snapshot().map_err(|_| ElevationError::LaunchFailed)?;
     dns_equality_result(&dns_before, &dns_after)?;
     let after = https_check().map_err(|_| ElevationError::LaunchFailed)?;
+    let hostname_after = https_hostname_check().map_err(|_| ElevationError::LaunchFailed)?;
     Ok(format!(
-        "Scoped TUN smoke: controller_pid={controller_pid} helper_pid={helper_pid} pipe_client_pid={} pipe_server_pid={controller_pid} adapter_alias={} adapter_index={} adapter_luid={} tun_delta_in={} tun_delta_out={} route_before={:?} route_during={:?} route_after={:?} dns_before={} dns_during={} dns_after={} void_tun_dns_during={} dns_equality=equal https_before={baseline} https_tun={through_tun} https_after={after}",
+        "TUN smoke: mode={} controller_pid={controller_pid} helper_pid={helper_pid} pipe_client_pid={} pipe_server_pid={controller_pid} adapter_alias={} adapter_index={} adapter_luid={} tun_delta_in={} tun_delta_out={} route_before={:?} route_during={:?} route_after={:?} full_routes_before={full_routes_before:?} full_routes_after={full_routes_after:?} dns_before={} dns_during={} dns_after={} void_tun_dns_during={} dns_equality=equal https_ip_before={baseline} https_ip_tun={through_tun} https_ip_after={after} https_hostname_before={hostname_baseline} https_hostname_tun={hostname_through_tun} https_hostname_after={hostname_after} udp_system_resolution={udp_resolution}",
+        if full_ipv4 { "full_ipv4" } else { "scoped" },
         pipe.peer_pid(),
         interface_before.alias,
         interface_before.index,
@@ -234,6 +352,29 @@ fn format_dns_adapters(
         .join(",")
 }
 
+fn recover_stale_owned_journal(app_data: &std::path::Path) -> Result<(), ElevationError> {
+    let journal_path = app_data.join("tun-session.json");
+    let Some(journal) =
+        TunSessionJournal::load(&journal_path).map_err(|_| ElevationError::LaunchFailed)?
+    else {
+        return Ok(());
+    };
+    let adapter_exists = void_tun_adapters()
+        .map_err(|_| ElevationError::LaunchFailed)?
+        .into_iter()
+        .any(|adapter| {
+            adapter.friendly_name == journal.adapter_name
+                && journal
+                    .adapter_luid
+                    .is_some_and(|luid| luid == adapter.luid)
+        });
+    let [first, second] = full_ipv4_routes().map_err(|_| ElevationError::LaunchFailed)?;
+    if adapter_exists || first.is_some() || second.is_some() {
+        return Err(ElevationError::LaunchFailed);
+    }
+    std::fs::remove_file(journal_path).map_err(|_| ElevationError::LaunchFailed)
+}
+
 fn https_check() -> Result<u16, String> {
     let response = reqwest::blocking::Client::builder()
         .no_proxy()
@@ -251,4 +392,32 @@ fn https_check() -> Result<u16, String> {
         return Err("HTTPS response exceeds smoke limit".into());
     }
     Ok(status)
+}
+
+fn https_hostname_check() -> Result<u16, String> {
+    let response = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|_| "Unable to prepare hostname HTTPS client")?
+        .get("https://www.cloudflare.com/cdn-cgi/trace")
+        .send()
+        .map_err(|_| "HostnameHttpsFailed")?;
+    Ok(response.status().as_u16())
+}
+
+/// Uses the regular Windows resolver, which may select UDP DNS internally. The
+/// resolved endpoint is intentionally not queried through a custom DNS socket.
+fn system_dns_udp_check() -> Result<usize, String> {
+    ("www.cloudflare.com", 443)
+        .to_socket_addrs()
+        .map(|addresses| addresses.filter(|address| address.is_ipv4()).count())
+        .map_err(|_| "SystemDnsResolutionFailed".into())
+        .and_then(|count| {
+            if count == 0 {
+                Err("SystemDnsReturnedNoIpv4Address".into())
+            } else {
+                Ok(count)
+            }
+        })
 }

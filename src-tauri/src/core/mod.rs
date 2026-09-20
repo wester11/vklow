@@ -1,4 +1,5 @@
 pub mod diagnostics;
+pub mod job;
 pub mod network;
 pub mod secrets;
 pub mod tun;

@@ -10,10 +10,17 @@ pub enum TunSessionPhase {
     StartingTun,
     AdapterReady,
     ScopedRouteReady,
+    FullIpv4RoutesReady,
     TrafficVerified,
     Stopping,
     Recovered,
     Completed,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunSessionPolicy {
+    ScopedSmoke,
+    FullIpv4Experimental,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +32,8 @@ pub struct OwnedRoute {
 #[serde(rename_all = "camelCase")]
 pub struct TunSessionJournal {
     pub schema_version: u8,
+    #[serde(default = "default_policy")]
+    pub policy: TunSessionPolicy,
     pub session_id: String,
     pub started_at: String,
     pub adapter_name: String,
@@ -33,12 +42,20 @@ pub struct TunSessionJournal {
     pub experimental_version: String,
     pub core_pid: Option<u32>,
     pub owned_routes: Vec<OwnedRoute>,
+    #[serde(default)]
+    pub tun_dns: Vec<String>,
     pub phase: TunSessionPhase,
 }
 impl TunSessionJournal {
-    pub fn new(session_id: String, adapter_name: String, experimental_version: String) -> Self {
+    pub fn new(
+        session_id: String,
+        adapter_name: String,
+        experimental_version: String,
+        policy: TunSessionPolicy,
+    ) -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
+            policy,
             session_id,
             started_at: chrono::Utc::now().to_rfc3339(),
             adapter_name,
@@ -47,6 +64,7 @@ impl TunSessionJournal {
             experimental_version,
             core_pid: None,
             owned_routes: Vec::new(),
+            tun_dns: Vec::new(),
             phase: TunSessionPhase::Prepared,
         }
     }
@@ -75,6 +93,10 @@ impl TunSessionJournal {
         self.phase = phase;
     }
 }
+
+fn default_policy() -> TunSessionPolicy {
+    TunSessionPolicy::ScopedSmoke
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +106,7 @@ mod tests {
             "session".into(),
             "VOID Tunnel session".into(),
             "v26.9.8".into(),
+            TunSessionPolicy::ScopedSmoke,
         );
         journal.owned_routes.push(OwnedRoute {
             destination: "1.1.1.1/32".into(),
@@ -101,6 +124,7 @@ mod tests {
             "session".into(),
             "VOID Tunnel session".into(),
             "v26.9.8".into(),
+            TunSessionPolicy::ScopedSmoke,
         );
         journal.adapter_luid = Some(42);
         journal.interface_index = Some(7);

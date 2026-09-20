@@ -5,11 +5,26 @@ use std::{
     time::Duration,
 };
 use void_desktop_lib::core::{
-    network::{has_default_route_on, interface_metadata, scoped_smoke_route},
-    tun::{TunSessionJournal, TunSessionPhase},
+    job::OwnedXrayJob,
+    network::{
+        full_ipv4_routes, has_default_route_on, interface_metadata, physical_default_routes,
+        scoped_smoke_route, void_tun_adapters,
+    },
+    tun::{OwnedRoute, TunSessionJournal, TunSessionPhase, TunSessionPolicy},
     tun_pipe::TunPipeConnection,
     tun_protocol::{TunOperation, TunRequest, TunResponse},
-    xray::{config::scoped_tun_smoke_config, manager::XrayCoreManager},
+    xray::{
+        config::{
+            full_ipv4_freedom_config, scoped_tun_smoke_config, FULL_IPV4_ROUTES, FULL_IPV4_TUN_DNS,
+        },
+        manager::XrayCoreManager,
+    },
+};
+use windows_sys::Win32::{
+    NetworkManagement::IpHelper::{
+        CreateIpForwardEntry2, DeleteIpForwardEntry2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
+    },
+    Networking::WinSock::AF_INET,
 };
 
 struct Bootstrap {
@@ -38,24 +53,46 @@ fn run() -> Result<(), String> {
     if request.controller_pid != bootstrap.controller_pid || request.helper_pid != helper_pid {
         return Err("TUN IPC process identity mismatch".into());
     }
-    if request.operation != TunOperation::StartScopedTunSession {
+    if !matches!(
+        request.operation,
+        TunOperation::StartScopedTunSession | TunOperation::StartFullIpv4Experimental
+    ) {
         let response = TunResponse::rejected(
             bootstrap.session_id.clone(),
             bootstrap.controller_pid,
             helper_pid,
-            "First helper request must start scoped TUN",
+            "First helper request must start a typed TUN policy",
         );
         pipe.write_frame(
             &serde_json::to_vec(&response).map_err(|_| "Unable to encode helper response")?,
         )?;
         return Err("Rejected TUN helper operation".into());
     }
-    let mut session = start_tun(&bootstrap)?;
+    let full_ipv4 = request.operation == TunOperation::StartFullIpv4Experimental;
+    let mut session = match start_tun(&bootstrap, full_ipv4) {
+        Ok(session) => session,
+        Err(error) => {
+            let response = TunResponse::rejected(
+                bootstrap.session_id.clone(),
+                bootstrap.controller_pid,
+                helper_pid,
+                &error,
+            );
+            let _ = pipe.write_frame(
+                &serde_json::to_vec(&response).map_err(|_| "Unable to encode helper response")?,
+            );
+            return Err(error);
+        }
+    };
     let response = TunResponse::accepted(
         bootstrap.session_id.clone(),
         bootstrap.controller_pid,
         helper_pid,
-        "scoped_tun_running",
+        if full_ipv4 {
+            "full_ipv4_tun_running"
+        } else {
+            "scoped_tun_running"
+        },
     );
     pipe.write_frame(
         &serde_json::to_vec(&response).map_err(|_| "Unable to encode helper response")?,
@@ -72,17 +109,41 @@ fn run() -> Result<(), String> {
     };
     if stop.controller_pid != bootstrap.controller_pid
         || stop.helper_pid != helper_pid
-        || stop.operation != TunOperation::StopTunSession
+        || !matches!(
+            stop.operation,
+            TunOperation::StopTunSession | TunOperation::TestCrashOwnedCore
+        )
     {
         let _ = session.stop();
         return Err("Invalid TUN stop request".into());
     }
-    session.stop()?;
+    let state = if stop.operation == TunOperation::TestCrashOwnedCore {
+        if session
+            .child
+            .try_wait()
+            .map_err(|_| "Unable to inspect owned Xray")?
+            .is_none()
+        {
+            session
+                .child
+                .kill()
+                .map_err(|_| "Unable to crash owned Xray")?;
+            session
+                .child
+                .wait()
+                .map_err(|_| "Unable to reap owned Xray")?;
+        }
+        session.stop()?;
+        "owned_core_crash_recovered"
+    } else {
+        session.stop()?;
+        "stopped"
+    };
     let response = TunResponse::accepted(
         bootstrap.session_id,
         bootstrap.controller_pid,
         helper_pid,
-        "stopped",
+        state,
     );
     pipe.write_frame(
         &serde_json::to_vec(&response).map_err(|_| "Unable to encode helper response")?,
@@ -91,15 +152,20 @@ fn run() -> Result<(), String> {
 
 struct OwnedTunSession {
     child: std::process::Child,
+    _job: OwnedXrayJob,
     config: std::path::PathBuf,
     journal_path: std::path::PathBuf,
     journal: TunSessionJournal,
+    manual_routes: Vec<MIB_IPFORWARD_ROW2>,
 }
 
 impl OwnedTunSession {
     fn stop(&mut self) -> Result<(), String> {
         self.journal.transition(TunSessionPhase::Stopping);
         self.journal.save_atomic(&self.journal_path)?;
+        for route in &self.manual_routes {
+            let _ = unsafe { DeleteIpForwardEntry2(route) };
+        }
         if self
             .child
             .try_wait()
@@ -117,7 +183,7 @@ impl OwnedTunSession {
     }
 }
 
-fn start_tun(bootstrap: &Bootstrap) -> Result<OwnedTunSession, String> {
+fn start_tun(bootstrap: &Bootstrap, full_ipv4: bool) -> Result<OwnedTunSession, String> {
     let app_data = env::var_os("APPDATA")
         .map(std::path::PathBuf::from)
         .ok_or("Unable to resolve VOID app data")?
@@ -140,7 +206,33 @@ fn start_tun(bootstrap: &Bootstrap) -> Result<OwnedTunSession, String> {
         bootstrap.session_id.clone(),
         adapter_name.clone(),
         "v26.9.8".into(),
+        if full_ipv4 {
+            TunSessionPolicy::FullIpv4Experimental
+        } else {
+            TunSessionPolicy::ScopedSmoke
+        },
     );
+    if full_ipv4 {
+        journal.owned_routes = FULL_IPV4_ROUTES
+            .iter()
+            .map(|destination| OwnedRoute {
+                destination: (*destination).into(),
+                interface_alias: adapter_name.clone(),
+            })
+            .collect();
+        journal.tun_dns = FULL_IPV4_TUN_DNS
+            .iter()
+            .map(|value| (*value).into())
+            .collect();
+        if physical_default_routes()?.is_empty() {
+            return Err("Physical IPv4 default route is absent before full TUN start".into());
+        }
+    } else {
+        journal.owned_routes = vec![OwnedRoute {
+            destination: "1.1.1.1/32".into(),
+            interface_alias: adapter_name.clone(),
+        }];
+    }
     journal.transition(TunSessionPhase::StartingTun);
     let journal_path = core.tun_journal_path();
     journal.save_atomic(&journal_path)?;
@@ -149,8 +241,12 @@ fn start_tun(bootstrap: &Bootstrap) -> Result<OwnedTunSession, String> {
         .join(format!("tun-{}.json", bootstrap.session_id));
     fs::write(
         &config,
-        serde_json::to_vec(&scoped_tun_smoke_config(&adapter_name)?)
-            .map_err(|_| "Unable to serialize TUN config")?,
+        serde_json::to_vec(&if full_ipv4 {
+            full_ipv4_freedom_config(&adapter_name)?
+        } else {
+            scoped_tun_smoke_config(&adapter_name)?
+        })
+        .map_err(|_| "Unable to serialize TUN config")?,
     )
     .map_err(|_| "Unable to write private TUN runtime config")?;
     let validation = Command::new(&binary)
@@ -173,6 +269,12 @@ fn start_tun(bootstrap: &Bootstrap) -> Result<OwnedTunSession, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| "Unable to launch verified experimental Xray")?;
+    let job = OwnedXrayJob::create()?;
+    if let Err(error) = job.assign(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
     journal.core_pid = Some(child.id());
     journal.save_atomic(&journal_path)?;
     thread::sleep(Duration::from_secs(3));
@@ -187,15 +289,68 @@ fn start_tun(bootstrap: &Bootstrap) -> Result<OwnedTunSession, String> {
     }
     let mut session = OwnedTunSession {
         child,
+        _job: job,
         config,
         journal_path,
         journal,
+        manual_routes: Vec::new(),
     };
-    if let Err(error) = wait_for_scoped_route(&mut session) {
+    if full_ipv4 {
+        let index = wait_for_owned_adapter(&session.journal.adapter_name)?;
+        session.manual_routes = install_full_ipv4_routes(index)?;
+    }
+    if let Err(error) = if full_ipv4 {
+        wait_for_full_ipv4_routes(&mut session)
+    } else {
+        wait_for_scoped_route(&mut session)
+    } {
         let _ = session.stop();
         return Err(error);
     }
     Ok(session)
+}
+
+fn wait_for_owned_adapter(adapter_name: &str) -> Result<u32, String> {
+    for _ in 0..40 {
+        if let Some(adapter) = void_tun_adapters()?
+            .into_iter()
+            .find(|adapter| adapter.friendly_name == adapter_name)
+        {
+            return Ok(adapter.if_index_v4);
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err("VOID adapter did not appear before full route installation".into())
+}
+
+fn install_full_ipv4_routes(index: u32) -> Result<Vec<MIB_IPFORWARD_ROW2>, String> {
+    let mut created = Vec::new();
+    for (destination, prefix_length) in [([0, 0, 0, 0], 1), ([128, 0, 0, 0], 1)] {
+        let mut route = MIB_IPFORWARD_ROW2::default();
+        unsafe { InitializeIpForwardEntry(&mut route) };
+        route.InterfaceIndex = index;
+        route.DestinationPrefix.PrefixLength = prefix_length;
+        route.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
+        route.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr = u32::from_be_bytes(destination);
+        route.NextHop.Ipv4.sin_family = AF_INET;
+        route.Metric = 1;
+        let status = unsafe { CreateIpForwardEntry2(&route) };
+        if status == 5010 {
+            // Xray's typed autoSystemRoutingTable won the race. It owns this
+            // route and will remove it with the owned core process.
+            return Ok(Vec::new());
+        }
+        if status != 0 {
+            for previous in &created {
+                let _ = unsafe { DeleteIpForwardEntry2(previous) };
+            }
+            return Err(format!(
+                "Unable to install owned full IPv4 route (Win32 {status})"
+            ));
+        }
+        created.push(route);
+    }
+    Ok(created)
 }
 
 fn wait_for_scoped_route(session: &mut OwnedTunSession) -> Result<(), String> {
@@ -229,6 +384,49 @@ fn wait_for_scoped_route(session: &mut OwnedTunSession) -> Result<(), String> {
         thread::sleep(Duration::from_millis(250));
     }
     Err("Scoped 1.1.1.1/32 route did not appear".into())
+}
+
+fn wait_for_full_ipv4_routes(session: &mut OwnedTunSession) -> Result<(), String> {
+    for _ in 0..40 {
+        if session
+            .child
+            .try_wait()
+            .map_err(|_| "Unable to inspect owned Xray")?
+            .is_some()
+        {
+            return Err("Experimental Xray exited before full IPv4 route readiness".into());
+        }
+        let [first, second] = full_ipv4_routes()?;
+        if let (Some(first), Some(second)) = (first, second) {
+            if first.interface_index != second.interface_index {
+                return Err("Full IPv4 routes do not share one VOID adapter".into());
+            }
+            if has_default_route_on(first.interface_index)? {
+                return Err("Unexpected VOID default route detected".into());
+            }
+            if physical_default_routes()?
+                .into_iter()
+                .all(|route| route.interface_index == first.interface_index)
+            {
+                return Err("Physical IPv4 default route was not retained".into());
+            }
+            let interface = interface_metadata(first.interface_index)?;
+            if interface.alias != session.journal.adapter_name {
+                return Err("Full IPv4 routes do not belong to the current VOID adapter".into());
+            }
+            session.journal.interface_index = Some(first.interface_index);
+            session.journal.adapter_luid = Some(interface.luid);
+            session.journal.transition(TunSessionPhase::AdapterReady);
+            session.journal.save_atomic(&session.journal_path)?;
+            session
+                .journal
+                .transition(TunSessionPhase::FullIpv4RoutesReady);
+            session.journal.save_atomic(&session.journal_path)?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err("Full IPv4 /1 routes did not appear".into())
 }
 
 fn parse_bootstrap(arguments: Vec<String>) -> Result<Bootstrap, String> {
