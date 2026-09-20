@@ -30,6 +30,13 @@ pub fn vless_reality_tcp(
         serde_json::json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":socks_port,"protocol":"socks","settings":{"udp":true}}],"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":input.address,"port":input.port,"users":[{"id":input.uuid,"encryption":"none","flow":input.flow}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":input.server_name,"fingerprint":input.fingerprint,"password":input.public_key,"shortId":input.short_id}}}]}),
     )
 }
+pub fn loopback_freedom_socks(socks_port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"udp": true}}],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -178,33 +178,56 @@ impl XrayCoreManager {
         result
     }
     pub fn connect(&self, server: &Server) -> Result<ConnectionState, String> {
-        let gen = {
-            let mut runtime = self
-                .runtime
-                .lock()
-                .map_err(|_| "Внутренняя ошибка Xray runtime")?;
-            if !matches!(
-                runtime.connection,
-                ConnectionState::Idle
-                    | ConnectionState::Error { .. }
-                    | ConnectionState::Crashed { .. }
-            ) {
-                return Err("Подключение уже выполняется или proxy уже запущен".into());
-            }
-            runtime.generation += 1;
-            runtime.connection = ConnectionState::Preparing;
-            runtime.generation
-        };
+        let gen = self.begin_connect()?;
         let result = self.start(server, gen);
         if let Err(error) = &result {
             self.fail(gen, error);
         }
         result
     }
+    #[cfg(test)]
+    fn connect_freedom_for_test(&self) -> Result<ConnectionState, String> {
+        let gen = self.begin_connect()?;
+        let port = Self::allocate_port()?;
+        let result = self.start_config(
+            gen,
+            port,
+            crate::core::xray::config::loopback_freedom_socks(port),
+            Vec::new(),
+        );
+        if let Err(error) = &result {
+            self.fail(gen, error);
+        }
+        result
+    }
+    fn begin_connect(&self) -> Result<u64, String> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "Внутренняя ошибка Xray runtime")?;
+        if !matches!(
+            runtime.connection,
+            ConnectionState::Idle | ConnectionState::Error { .. } | ConnectionState::Crashed { .. }
+        ) {
+            return Err("Подключение уже выполняется или proxy уже запущен".into());
+        }
+        runtime.generation += 1;
+        runtime.connection = ConnectionState::Preparing;
+        Ok(runtime.generation)
+    }
     fn start(&self, server: &Server, gen: u64) -> Result<ConnectionState, String> {
-        let binary = self.active_binary()?;
         let port = Self::allocate_port()?;
         let config = self.config_for(server, port)?;
+        self.start_config(gen, port, config, Self::secrets(server))
+    }
+    fn start_config(
+        &self,
+        gen: u64,
+        port: u16,
+        config: serde_json::Value,
+        secrets: Vec<String>,
+    ) -> Result<ConnectionState, String> {
+        let binary = self.active_binary()?;
         let path = self.paths.runtime().join(format!("xray-{gen}.json"));
         fs::write(
             &path,
@@ -212,7 +235,6 @@ impl XrayCoreManager {
         )
         .map_err(|_| "Не удалось записать runtime config")?;
         self.set_state(gen, ConnectionState::ValidatingConfig)?;
-        let secrets = Self::secrets(server);
         Self::validate(&binary, &path, &secrets)?;
         self.set_state(gen, ConnectionState::StartingCore)?;
         let mut child = Command::new(&binary)
@@ -518,6 +540,10 @@ impl XrayCoreManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
     #[test]
     fn new_manager_reports_not_installed() {
         let root = std::env::temp_dir().join(format!("void-core-{}", uuid::Uuid::new_v4()));
@@ -526,5 +552,81 @@ mod tests {
             manager.status().install_state,
             CoreInstallState::NotInstalled
         ));
+    }
+    #[test]
+    fn real_xray_socks_reconnects_when_verified_fixture_is_supplied() {
+        let Some(archive) = std::env::var_os("VOID_XRAY_TEST_ARCHIVE") else {
+            return;
+        };
+        let Some(digest) = std::env::var_os("VOID_XRAY_TEST_DIGEST") else {
+            return;
+        };
+        let version: XrayVersion = std::env::var("VOID_XRAY_TEST_VERSION")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .expect("VOID_XRAY_TEST_VERSION must be an Xray version");
+        let root =
+            std::env::temp_dir().join(format!("void-xray-integration-{}", uuid::Uuid::new_v4()));
+        let manager = XrayCoreManager::load(root.clone());
+        manager
+            .install_verified_core(
+                Path::new(&archive),
+                &fs::read_to_string(digest).unwrap(),
+                version,
+            )
+            .unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let origin = listener.local_addr().unwrap();
+        let token = format!("void-{}", uuid::Uuid::new_v4());
+        let expected = token.clone();
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    expected.len(),
+                    expected
+                )
+                .unwrap();
+            }
+        });
+        for _ in 0..2 {
+            let ConnectionState::ProxyReady { socks_port } =
+                manager.connect_freedom_for_test().unwrap()
+            else {
+                panic!("proxy was not ready")
+            };
+            let client = reqwest::blocking::Client::builder()
+                .proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}")).unwrap())
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+            assert_eq!(
+                client
+                    .get(format!("http://{origin}/"))
+                    .send()
+                    .unwrap()
+                    .text()
+                    .unwrap(),
+                token
+            );
+            assert!(matches!(
+                manager.disconnect().unwrap(),
+                ConnectionState::Idle
+            ));
+        }
+        assert!(!root
+            .join("xray")
+            .join("runtime")
+            .read_dir()
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "json")));
     }
 }
