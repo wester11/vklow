@@ -2,7 +2,7 @@ pub mod core;
 pub mod domain;
 mod subscription;
 use chrono::Utc;
-use core::xray::manager::{CoreStatus, XrayCoreManager};
+use core::xray::manager::{CoreStatus, TunCapabilityStatus, XrayCoreManager};
 use core::{
     diagnostics::{
         export as export_diagnostics_file, process_state, socks_listen, DiagnosticsSnapshot,
@@ -67,6 +67,10 @@ fn get_connection_status(state: State<'_, AppState>) -> Result<ConnectionState, 
 #[tauri::command]
 fn install_core(state: State<'_, AppState>) -> Result<CoreStatus, String> {
     state.core.install_latest_official()
+}
+#[tauri::command]
+fn get_tun_capability(state: State<'_, AppState>) -> TunCapabilityStatus {
+    state.core.validate_tun_capability()
 }
 #[tauri::command]
 fn get_diagnostics(state: State<'_, AppState>) -> Result<DiagnosticsSnapshot, String> {
@@ -244,6 +248,7 @@ pub fn run() {
             get_diagnostics,
             export_diagnostics,
             install_core,
+            get_tun_capability,
             add_subscription,
             import_uri,
             select_server,

@@ -1,6 +1,27 @@
 use serde::Serialize;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TunInboundSettings {
+    pub name: String,
+    pub desc: String,
+    pub mtu: u32,
+    pub gateway: Vec<String>,
+    pub dns: Vec<String>,
+    pub auto_system_routing_table: Vec<String>,
+    pub auto_outbounds_interface: String,
+}
+#[derive(Serialize)]
+struct TunInbound {
+    protocol: &'static str,
+    settings: TunInboundSettings,
+}
+#[derive(Serialize)]
+struct TunValidationConfig {
+    inbounds: Vec<TunInbound>,
+    outbounds: Vec<serde_json::Value>,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VlessRealityOutbound {
     pub address: String,
     pub port: u16,
@@ -37,6 +58,24 @@ pub fn loopback_freedom_socks(socks_port: u16) -> serde_json::Value {
         "outbounds": [{"tag": "direct", "protocol": "freedom"}]
     })
 }
+pub fn tun_capability_config() -> Result<serde_json::Value, String> {
+    serde_json::to_value(TunValidationConfig {
+        inbounds: vec![TunInbound {
+            protocol: "tun",
+            settings: TunInboundSettings {
+                name: "VOID Capability Probe".into(),
+                desc: "VOID Desktop".into(),
+                mtu: 1500,
+                gateway: vec!["172.30.0.1/30".into()],
+                dns: vec!["1.1.1.1".into()],
+                auto_system_routing_table: Vec::new(),
+                auto_outbounds_interface: "auto".into(),
+            },
+        }],
+        outbounds: vec![serde_json::json!({"protocol": "freedom"})],
+    })
+    .map_err(|_| "Не удалось сериализовать TUN capability config".into())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,5 +97,14 @@ mod tests {
         .unwrap();
         assert_eq!(c["inbounds"][0]["listen"], "127.0.0.1");
         assert_eq!(c["outbounds"][0]["streamSettings"]["security"], "reality");
+    }
+    #[test]
+    fn uses_current_xray_tun_field_shapes() {
+        let value = tun_capability_config().unwrap();
+        assert!(value["inbounds"][0]["settings"]["autoSystemRoutingTable"].is_array());
+        assert_eq!(
+            value["inbounds"][0]["settings"]["autoOutboundsInterface"],
+            "auto"
+        );
     }
 }

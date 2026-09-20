@@ -1,7 +1,7 @@
 use crate::{
     core::xray::{
         archive::extract_verified_zip,
-        config::{vless_reality_tcp, VlessRealityOutbound},
+        config::{tun_capability_config, vless_reality_tcp, VlessRealityOutbound},
         integrity::{parse_dgst_for_asset, verify_sha256},
         paths::XrayPaths,
         redaction::redact,
@@ -41,6 +41,14 @@ pub struct CoreStatus {
     pub active_version: Option<String>,
     pub previous_version: Option<String>,
     pub last_error: Option<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunCapabilityStatus {
+    pub supported: bool,
+    pub wintun_present: bool,
+    pub elevation_required: bool,
+    pub message: Option<String>,
 }
 struct ManagedProcess {
     child: Arc<Mutex<Child>>,
@@ -125,6 +133,49 @@ impl XrayCoreManager {
     }
     pub fn diagnostics_directory(&self) -> PathBuf {
         self.paths.root().join("diagnostics")
+    }
+    pub fn validate_tun_capability(&self) -> TunCapabilityStatus {
+        let result = (|| {
+            let binary = self.active_binary()?;
+            let wintun = binary.with_file_name("wintun.dll");
+            if !wintun.is_file() {
+                return Err(
+                    "Официальный wintun.dll отсутствует рядом с установленным xray.exe".into(),
+                );
+            }
+            let path = self.paths.runtime().join("tun-capability.json");
+            fs::write(
+                &path,
+                serde_json::to_vec(&tun_capability_config()?)
+                    .map_err(|_| "Не удалось сериализовать TUN capability config")?,
+            )
+            .map_err(|_| "Не удалось записать TUN capability config")?;
+            let validation = Self::validate(&binary, &path, &[]);
+            let _ = fs::remove_file(path);
+            validation
+        })();
+        match result {
+            Ok(()) => TunCapabilityStatus {
+                supported: true,
+                wintun_present: true,
+                elevation_required: false,
+                message: None,
+            },
+            Err(message) => {
+                let elevation_required = message.contains("0x00000005")
+                    || message.to_ascii_lowercase().contains("access denied")
+                    || message.contains("Отказано в доступе");
+                TunCapabilityStatus {
+                    supported: elevation_required,
+                    wintun_present: self
+                        .active_binary()
+                        .ok()
+                        .is_some_and(|binary| binary.with_file_name("wintun.dll").is_file()),
+                    elevation_required,
+                    message: Some(message),
+                }
+            }
+        }
     }
     pub fn install_verified_core(
         &self,
@@ -570,6 +621,23 @@ mod tests {
             manager.status().install_state,
             CoreInstallState::NotInstalled
         ));
+    }
+    #[test]
+    fn validates_tun_capability_with_verified_fixture_when_supplied() {
+        let root =
+            std::env::temp_dir().join(format!("void-tun-capability-{}", uuid::Uuid::new_v4()));
+        let manager = XrayCoreManager::load(root);
+        if !install_test_core(&manager) {
+            return;
+        }
+        let capability = manager.validate_tun_capability();
+        assert!(capability.wintun_present);
+        assert!(capability.supported);
+        assert!(
+            capability.elevation_required || capability.message.is_none(),
+            "{:?}",
+            capability.message
+        );
     }
     #[test]
     fn real_xray_socks_reconnects_when_verified_fixture_is_supplied() {
