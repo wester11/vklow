@@ -10,6 +10,8 @@ use windows_sys::Win32::{
 #[derive(Debug)]
 pub enum ElevationError {
     ElevationCancelled,
+    SmokeInconclusiveNetworkChanged,
+    PhysicalDnsMutated,
     LaunchFailed,
     InvalidHelperLayout,
 }
