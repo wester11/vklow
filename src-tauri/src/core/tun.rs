@@ -4,11 +4,16 @@ use std::{fs, path::Path};
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TunSessionPhase {
-    Preparing,
+    Prepared,
+    Elevating,
+    HelperReady,
+    StartingTun,
     AdapterReady,
     ScopedRouteReady,
+    TrafficVerified,
     Stopping,
     Recovered,
+    Completed,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,20 +28,26 @@ pub struct TunSessionJournal {
     pub session_id: String,
     pub started_at: String,
     pub adapter_name: String,
+    pub adapter_luid: Option<u64>,
+    pub interface_index: Option<u32>,
+    pub experimental_version: String,
     pub core_pid: Option<u32>,
     pub owned_routes: Vec<OwnedRoute>,
     pub phase: TunSessionPhase,
 }
 impl TunSessionJournal {
-    pub fn new(session_id: String, adapter_name: String) -> Self {
+    pub fn new(session_id: String, adapter_name: String, experimental_version: String) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             session_id,
             started_at: chrono::Utc::now().to_rfc3339(),
             adapter_name,
+            adapter_luid: None,
+            interface_index: None,
+            experimental_version,
             core_pid: None,
             owned_routes: Vec::new(),
-            phase: TunSessionPhase::Preparing,
+            phase: TunSessionPhase::Prepared,
         }
     }
     pub fn save_atomic(&self, path: &Path) -> Result<(), String> {
@@ -60,13 +71,20 @@ impl TunSessionJournal {
     pub fn owns_route(&self, route: &OwnedRoute) -> bool {
         self.owned_routes.contains(route) && route.interface_alias == self.adapter_name
     }
+    pub fn transition(&mut self, phase: TunSessionPhase) {
+        self.phase = phase;
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn journal_matches_only_its_own_route() {
-        let mut journal = TunSessionJournal::new("session".into(), "VOID Tunnel session".into());
+        let mut journal = TunSessionJournal::new(
+            "session".into(),
+            "VOID Tunnel session".into(),
+            "v26.9.8".into(),
+        );
         journal.owned_routes.push(OwnedRoute {
             destination: "1.1.1.1/32".into(),
             interface_alias: "VOID Tunnel session".into(),
@@ -76,5 +94,19 @@ mod tests {
             destination: "1.1.1.1/32".into(),
             interface_alias: "Other VPN".into()
         }));
+    }
+    #[test]
+    fn journal_records_owned_adapter_identity_and_phase() {
+        let mut journal = TunSessionJournal::new(
+            "session".into(),
+            "VOID Tunnel session".into(),
+            "v26.9.8".into(),
+        );
+        journal.adapter_luid = Some(42);
+        journal.interface_index = Some(7);
+        journal.transition(TunSessionPhase::ScopedRouteReady);
+        assert_eq!(journal.phase, TunSessionPhase::ScopedRouteReady);
+        assert_eq!(journal.adapter_luid, Some(42));
+        assert_eq!(journal.interface_index, Some(7));
     }
 }
