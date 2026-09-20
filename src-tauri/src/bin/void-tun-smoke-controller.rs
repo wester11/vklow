@@ -21,6 +21,10 @@ fn main() {
 }
 
 fn run() -> Result<String, ElevationError> {
+    let abort_after_route = cfg!(debug_assertions)
+        && env::args()
+            .skip(1)
+            .any(|argument| argument == "--abort-after-route");
     let route_before = scoped_smoke_route().map_err(|_| ElevationError::LaunchFailed)?;
     let app_data = env::var_os("APPDATA")
         .map(std::path::PathBuf::from)
@@ -102,6 +106,18 @@ fn run() -> Result<String, ElevationError> {
         .map_err(|_| ElevationError::LaunchFailed)?;
     if !interface_before.alias.starts_with("VOID Tunnel ") {
         return Err(ElevationError::LaunchFailed);
+    }
+    if abort_after_route {
+        drop(pipe);
+        thread::sleep(Duration::from_secs(3));
+        let route_after_abort = scoped_smoke_route().map_err(|_| ElevationError::LaunchFailed)?;
+        if route_after_abort != route_before {
+            return Err(ElevationError::LaunchFailed);
+        }
+        let after_abort = https_check().map_err(|_| ElevationError::LaunchFailed)?;
+        return Ok(format!(
+            "Controlled failure cleanup: controller_pid={controller_pid} helper_pid={helper_pid} route_after={route_after_abort:?} https_after={after_abort}"
+        ));
     }
     let through_tun = https_check().map_err(|_| ElevationError::LaunchFailed)?;
     let interface_after = interface_metadata(route_during.interface_index)
