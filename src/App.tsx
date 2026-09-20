@@ -6,7 +6,7 @@ import type { AppSnapshot, ConnectionState, ServerSummary, Subscription } from "
 
 type Page = "home" | "servers" | "subscriptions" | "settings";
 const emptySnapshot: AppSnapshot = { connection: { kind: "idle" }, servers: [], subscriptions: [], selectedServerId: null };
-const connectionLabel: Record<ConnectionState["kind"], string> = { idle: "Не подключено", preparing: "Подготовка", starting_core: "Запуск ядра", connected: "Подключено", stopping: "Отключение", error: "Требуется действие" };
+const connectionLabel: Record<ConnectionState["kind"], string> = { idle: "Не подключено", preparing: "Подготовка", validating_config: "Проверка конфигурации", starting_core: "Запуск ядра", waiting_for_proxy: "Ожидание proxy", proxy_ready: "Proxy готов", connected: "Proxy готов", stopping: "Отключение", crashed: "Ядро завершилось", error: "Требуется действие" };
 
 export default function App() {
   const [page, setPage] = useState<Page>("home"); const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot); const [isImportOpen, setImportOpen] = useState(false); const [source, setSource] = useState(""); const [busy, setBusy] = useState(false); const [notice, setNotice] = useState<string | null>(null);

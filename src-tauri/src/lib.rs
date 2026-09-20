@@ -1,5 +1,5 @@
-mod core;
-mod domain;
+pub mod core;
+pub mod domain;
 mod subscription;
 use chrono::Utc;
 use core::xray::manager::{CoreStatus, XrayCoreManager};
@@ -52,6 +52,10 @@ fn get_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, String> {
 #[tauri::command]
 fn get_core_status(state: State<'_, AppState>) -> CoreStatus {
     state.core.status()
+}
+#[tauri::command]
+fn get_connection_status(state: State<'_, AppState>) -> Result<ConnectionState, String> {
+    state.core.connection_status()
 }
 #[tauri::command]
 async fn add_subscription(url: String, state: State<'_, AppState>) -> Result<ImportResult, String> {
@@ -113,36 +117,39 @@ fn select_server(server_id: Option<String>, state: State<'_, AppState>) -> Resul
 }
 #[tauri::command]
 fn connect(state: State<'_, AppState>) -> Result<(), String> {
+    let server = {
+        let runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "Внутренняя ошибка состояния")?;
+        if runtime.servers.is_empty() {
+            return Err("Сначала добавьте подписку или URI сервера".into());
+        }
+        let selected = runtime.selected_server_id.as_ref();
+        runtime
+            .servers
+            .iter()
+            .find(|item| Some(&item.summary.id) == selected)
+            .or_else(|| runtime.servers.first())
+            .cloned()
+            .ok_or("Выбранный сервер больше недоступен")?
+    };
+    let connection = state.core.connect(&server)?;
     let mut runtime = state
         .runtime
         .lock()
         .map_err(|_| "Внутренняя ошибка состояния")?;
-    if runtime.servers.is_empty() {
-        return Err("Сначала добавьте подписку или URI сервера".into());
-    }
-    if !matches!(
-        state.core.status().install_state,
-        core::xray::manager::CoreInstallState::Ready
-    ) {
-        runtime.connection = ConnectionState::Error {
-            message: "VPN-ядро не установлено".into(),
-        };
-        return Err(
-            "VPN-ядро не установлено. Установите проверенный Xray-core перед подключением.".into(),
-        );
-    }
-    runtime.connection = ConnectionState::Error {
-        message: "Core installation готова, но запуск процесса ещё не реализован".into(),
-    };
-    Err("Запуск Xray process manager ещё не реализован; подключение не имитируется.".into())
+    runtime.connection = connection;
+    Ok(())
 }
 #[tauri::command]
 fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
+    let connection = state.core.disconnect()?;
     let mut runtime = state
         .runtime
         .lock()
         .map_err(|_| "Внутренняя ошибка состояния")?;
-    runtime.connection = ConnectionState::Idle;
+    runtime.connection = connection;
     Ok(())
 }
 #[derive(serde::Serialize)]
@@ -168,6 +175,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             get_core_status,
+            get_connection_status,
             add_subscription,
             import_uri,
             select_server,

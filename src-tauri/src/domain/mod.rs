@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
@@ -35,6 +36,8 @@ pub struct Server {
     pub credential: String,
     pub security: Option<String>,
     pub sni: Option<String>,
+    /// Connection parameters are backend-only because they may contain credentials.
+    pub options: HashMap<String, String>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,10 +52,20 @@ pub struct Subscription {
 pub enum ConnectionState {
     Idle,
     Preparing,
+    ValidatingConfig,
     StartingCore,
-    Connected,
+    WaitingForProxy,
+    #[serde(rename = "connected")]
+    ProxyReady {
+        socks_port: u16,
+    },
     Stopping,
-    Error { message: String },
+    Crashed {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

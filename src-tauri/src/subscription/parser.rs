@@ -22,7 +22,7 @@ pub fn parse_uri(input: &str) -> Result<Server, String> {
         _ => Err("Неподдерживаемый протокол".into()),
     }
 }
-fn base_server(
+struct ServerInput {
     protocol: Protocol,
     name: String,
     address: String,
@@ -31,26 +31,29 @@ fn base_server(
     credential: String,
     security: Option<String>,
     sni: Option<String>,
-) -> Server {
+    options: HashMap<String, String>,
+}
+fn base_server(input: ServerInput) -> Server {
     Server {
         summary: ServerSummary {
             id: Uuid::new_v4().to_string(),
-            name: if name.trim().is_empty() {
-                format!("{}:{}", address, port)
+            name: if input.name.trim().is_empty() {
+                format!("{}:{}", input.address, input.port)
             } else {
-                name
+                input.name
             },
-            protocol,
-            address,
-            port,
-            transport,
+            protocol: input.protocol,
+            address: input.address,
+            port: input.port,
+            transport: input.transport,
             country: None,
             health: ServerHealth::Unknown,
             latency_ms: None,
         },
-        credential,
-        security,
-        sni,
+        credential: input.credential,
+        security: input.security,
+        sni: input.sni,
+        options: input.options,
     }
 }
 fn parse_standard(input: &str, protocol: Protocol) -> Result<Server, String> {
@@ -68,16 +71,17 @@ fn parse_standard(input: &str, protocol: Protocol) -> Result<Server, String> {
     let name = percent_decode_str(url.fragment().unwrap_or_default())
         .decode_utf8_lossy()
         .into_owned();
-    Ok(base_server(
+    Ok(base_server(ServerInput {
         protocol,
         name,
         address,
         port,
-        query.get("type").cloned(),
-        credential.to_owned(),
-        query.get("security").cloned(),
-        query.get("sni").cloned(),
-    ))
+        transport: query.get("type").cloned(),
+        credential: credential.to_owned(),
+        security: query.get("security").cloned(),
+        sni: query.get("sni").cloned(),
+        options: query,
+    }))
 }
 fn parse_shadowsocks(input: &str) -> Result<Server, String> {
     let raw = input
@@ -100,16 +104,17 @@ fn parse_shadowsocks(input: &str) -> Result<Server, String> {
     let address = url.host_str().ok_or("В URI отсутствует сервер")?.to_owned();
     let port = url.port().ok_or("В URI отсутствует порт")?;
     let password = url.password().ok_or("В URI отсутствует пароль")?;
-    Ok(base_server(
-        Protocol::Shadowsocks,
-        name.to_owned(),
+    Ok(base_server(ServerInput {
+        protocol: Protocol::Shadowsocks,
+        name: name.to_owned(),
         address,
         port,
-        None,
-        format!("{}:{}", url.username(), password),
-        None,
-        None,
-    ))
+        transport: None,
+        credential: format!("{}:{}", url.username(), password),
+        security: None,
+        sni: None,
+        options: HashMap::new(),
+    }))
 }
 #[derive(Deserialize)]
 struct Vmess {
@@ -149,16 +154,17 @@ fn parse_vmess(input: &str) -> Result<Server, String> {
     if item.address.trim().is_empty() || item.id.trim().is_empty() {
         return Err("VMess-конфигурация неполная".into());
     }
-    Ok(base_server(
-        Protocol::Vmess,
-        item.name,
-        item.address,
+    Ok(base_server(ServerInput {
+        protocol: Protocol::Vmess,
+        name: item.name,
+        address: item.address,
         port,
-        (!item.transport.is_empty()).then_some(item.transport),
-        item.id,
-        (!item.tls.is_empty()).then_some(item.tls),
-        (!item.sni.is_empty()).then_some(item.sni),
-    ))
+        transport: (!item.transport.is_empty()).then_some(item.transport),
+        credential: item.id,
+        security: (!item.tls.is_empty()).then_some(item.tls),
+        sni: (!item.sni.is_empty()).then_some(item.sni),
+        options: HashMap::new(),
+    }))
 }
 #[cfg(test)]
 mod tests {
@@ -170,6 +176,7 @@ mod tests {
         assert_eq!(item.summary.port, 443);
         assert_eq!(item.summary.name, "NL Edge");
         assert!(matches!(item.summary.protocol, Protocol::Vless));
+        assert_eq!(item.options["security"], "reality");
     }
     #[test]
     fn rejects_unknown_scheme() {

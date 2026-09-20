@@ -19,7 +19,7 @@ pub fn vless_reality_tcp(
         return Err("Reality-конфигурация неполная".into());
     }
     if input.short_id.len() > 16
-        || input.short_id.len() % 2 != 0
+        || !input.short_id.len().is_multiple_of(2)
         || !input.short_id.bytes().all(|c| c.is_ascii_hexdigit())
     {
         return Err(

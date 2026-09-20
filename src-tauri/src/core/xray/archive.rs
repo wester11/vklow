@@ -62,10 +62,8 @@ pub fn extract_verified_zip(archive: &Path, destination: &Path) -> Result<PathBu
         let mut output =
             File::create(&target).map_err(|_| "Не удалось записать Xray staging file")?;
         io::copy(&mut entry, &mut output).map_err(|_| "Не удалось распаковать Xray archive")?;
-        if relative == Path::new("xray.exe") {
-            if binary.replace(target).is_some() {
-                return Err("Xray archive содержит несколько xray.exe".into());
-            }
+        if relative == Path::new("xray.exe") && binary.replace(target).is_some() {
+            return Err("Xray archive содержит несколько xray.exe".into());
         }
     }
     binary.ok_or_else(|| "Xray archive не содержит ожидаемый xray.exe".into())
