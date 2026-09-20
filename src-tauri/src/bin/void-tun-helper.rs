@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 use void_desktop_lib::core::{
-    network::{has_default_route_on, scoped_smoke_route},
+    network::{has_default_route_on, interface_metadata, scoped_smoke_route},
     tun::{TunSessionJournal, TunSessionPhase},
     tun_pipe::TunPipeConnection,
     tun_protocol::{TunOperation, TunRequest, TunResponse},
@@ -212,7 +212,14 @@ fn wait_for_scoped_route(session: &mut OwnedTunSession) -> Result<(), String> {
             if has_default_route_on(route.interface_index)? {
                 return Err("Unexpected VOID default route detected".into());
             }
+            let interface = interface_metadata(route.interface_index)?;
+            if interface.alias != session.journal.adapter_name {
+                return Err("Scoped route does not belong to the current VOID adapter".into());
+            }
             session.journal.interface_index = Some(route.interface_index);
+            session.journal.adapter_luid = Some(interface.luid);
+            session.journal.transition(TunSessionPhase::AdapterReady);
+            session.journal.save_atomic(&session.journal_path)?;
             session
                 .journal
                 .transition(TunSessionPhase::ScopedRouteReady);

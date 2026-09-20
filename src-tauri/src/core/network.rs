@@ -2,7 +2,8 @@
 
 use windows_sys::Win32::{
     NetworkManagement::IpHelper::{
-        FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+        FreeMibTable, GetIfEntry2, GetIpForwardTable2, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
+        MIB_IPFORWARD_TABLE2,
     },
     Networking::WinSock::AF_INET,
 };
@@ -12,6 +13,35 @@ pub struct Ipv4Route {
     pub destination: [u8; 4],
     pub prefix_length: u8,
     pub interface_index: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceMetadata {
+    pub index: u32,
+    pub alias: String,
+    pub luid: u64,
+    pub in_octets: u64,
+    pub out_octets: u64,
+}
+
+pub fn interface_metadata(index: u32) -> Result<InterfaceMetadata, String> {
+    let mut row = MIB_IF_ROW2 {
+        InterfaceIndex: index,
+        ..Default::default()
+    };
+    if unsafe { GetIfEntry2(&mut row) } != 0 {
+        return Err("Unable to read Windows interface metadata".into());
+    }
+    let alias = String::from_utf16_lossy(&row.Alias)
+        .trim_end_matches('\0')
+        .to_owned();
+    Ok(InterfaceMetadata {
+        index,
+        alias,
+        luid: unsafe { row.InterfaceLuid.Value },
+        in_octets: row.InOctets,
+        out_octets: row.OutOctets,
+    })
 }
 
 pub fn ipv4_routes() -> Result<Vec<Ipv4Route>, String> {

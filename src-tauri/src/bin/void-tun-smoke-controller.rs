@@ -1,6 +1,6 @@
 use std::{env, process, sync::mpsc, thread, time::Duration};
 use void_desktop_lib::core::{
-    network::{has_default_route_on, scoped_smoke_route},
+    network::{has_default_route_on, interface_metadata, scoped_smoke_route},
     tun_launcher::{launch_elevated_helper, ElevationError},
     tun_pipe::TunPipeServer,
     tun_protocol::{TunOperation, TunRequest, TunResponse, IPC_PROTOCOL_VERSION},
@@ -98,7 +98,14 @@ fn run() -> Result<String, ElevationError> {
     {
         return Err(ElevationError::LaunchFailed);
     }
+    let interface_before = interface_metadata(route_during.interface_index)
+        .map_err(|_| ElevationError::LaunchFailed)?;
+    if !interface_before.alias.starts_with("VOID Tunnel ") {
+        return Err(ElevationError::LaunchFailed);
+    }
     let through_tun = https_check().map_err(|_| ElevationError::LaunchFailed)?;
+    let interface_after = interface_metadata(route_during.interface_index)
+        .map_err(|_| ElevationError::LaunchFailed)?;
     let stop = TunRequest {
         protocol_version: IPC_PROTOCOL_VERSION,
         session_id: session_id.clone(),
@@ -124,8 +131,13 @@ fn run() -> Result<String, ElevationError> {
     }
     let after = https_check().map_err(|_| ElevationError::LaunchFailed)?;
     Ok(format!(
-        "Scoped TUN smoke: controller_pid={controller_pid} helper_pid={helper_pid} pipe_client_pid={} pipe_server_pid={controller_pid} route_before={:?} route_during={:?} route_after={:?} https_before={baseline} https_tun={through_tun} https_after={after}",
+        "Scoped TUN smoke: controller_pid={controller_pid} helper_pid={helper_pid} pipe_client_pid={} pipe_server_pid={controller_pid} adapter_alias={} adapter_index={} adapter_luid={} tun_delta_in={} tun_delta_out={} route_before={:?} route_during={:?} route_after={:?} https_before={baseline} https_tun={through_tun} https_after={after}",
         pipe.peer_pid(),
+        interface_before.alias,
+        interface_before.index,
+        interface_before.luid,
+        interface_after.in_octets.saturating_sub(interface_before.in_octets),
+        interface_after.out_octets.saturating_sub(interface_before.out_octets),
         route_before,
         route_during,
         route_after,
