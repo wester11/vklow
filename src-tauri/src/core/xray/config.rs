@@ -76,6 +76,34 @@ pub fn tun_capability_config() -> Result<serde_json::Value, String> {
     })
     .map_err(|_| "Не удалось сериализовать TUN capability config".into())
 }
+pub const SCOPED_SMOKE_ROUTE: &str = "1.1.1.1/32";
+
+pub fn scoped_tun_smoke_config(adapter_name: &str) -> Result<serde_json::Value, String> {
+    if adapter_name.len() > 96
+        || adapter_name.is_empty()
+        || !adapter_name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, ' ' | '-'))
+    {
+        return Err("Недопустимое имя VOID TUN adapter".into());
+    }
+    serde_json::to_value(TunValidationConfig {
+        inbounds: vec![TunInbound {
+            protocol: "tun",
+            settings: TunInboundSettings {
+                name: adapter_name.into(),
+                desc: "VOID Experimental TUN".into(),
+                mtu: 1500,
+                gateway: vec!["198.18.0.1/30".into()],
+                dns: Vec::new(),
+                auto_system_routing_table: vec![SCOPED_SMOKE_ROUTE.into()],
+                auto_outbounds_interface: "auto".into(),
+            },
+        }],
+        outbounds: vec![serde_json::json!({"tag":"direct","protocol":"freedom"})],
+    })
+    .map_err(|_| "Не удалось сериализовать scoped TUN config".into())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +133,21 @@ mod tests {
         assert_eq!(
             value["inbounds"][0]["settings"]["autoOutboundsInterface"],
             "auto"
+        );
+    }
+    #[test]
+    fn scopes_experimental_tun_to_the_single_approved_route() {
+        let value = scoped_tun_smoke_config("VOID Tunnel 1234").unwrap();
+        let settings = &value["inbounds"][0]["settings"];
+        assert_eq!(settings["dns"], serde_json::json!([]));
+        assert_eq!(
+            settings["autoSystemRoutingTable"],
+            serde_json::json!([SCOPED_SMOKE_ROUTE])
+        );
+        assert_eq!(settings["autoOutboundsInterface"], "auto");
+        assert_ne!(
+            settings["autoSystemRoutingTable"],
+            serde_json::json!(["0.0.0.0/0"])
         );
     }
 }
