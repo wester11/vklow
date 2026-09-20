@@ -507,6 +507,21 @@ impl XrayCoreManager {
             *last = Some(error.into());
         }
     }
+    #[cfg(test)]
+    fn terminate_owned_process_for_test(&self) -> Result<(), String> {
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "Внутренняя ошибка Xray runtime")?;
+        let process = runtime.process.as_ref().ok_or("Нет owned Xray process")?;
+        let result = process
+            .child
+            .lock()
+            .map_err(|_| "Внутренняя ошибка owned Xray process")?
+            .kill()
+            .map_err(|_| "Не удалось остановить owned Xray process".to_owned());
+        result
+    }
     fn secrets(s: &Server) -> Vec<String> {
         let mut values = vec![s.credential.clone()];
         values.extend(s.options.values().cloned());
@@ -628,5 +643,39 @@ mod tests {
                 .path()
                 .extension()
                 .is_some_and(|ext| ext == "json")));
+    }
+    #[test]
+    fn managed_xray_crash_is_detected_when_verified_fixture_is_supplied() {
+        let Some(archive) = std::env::var_os("VOID_XRAY_TEST_ARCHIVE") else {
+            return;
+        };
+        let Some(digest) = std::env::var_os("VOID_XRAY_TEST_DIGEST") else {
+            return;
+        };
+        let version: XrayVersion = std::env::var("VOID_XRAY_TEST_VERSION")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .expect("VOID_XRAY_TEST_VERSION must be an Xray version");
+        let root = std::env::temp_dir().join(format!("void-xray-crash-{}", uuid::Uuid::new_v4()));
+        let manager = XrayCoreManager::load(root);
+        manager
+            .install_verified_core(
+                Path::new(&archive),
+                &fs::read_to_string(digest).unwrap(),
+                version,
+            )
+            .unwrap();
+        manager.connect_freedom_for_test().unwrap();
+        manager.terminate_owned_process_for_test().unwrap();
+        for _ in 0..30 {
+            if matches!(
+                manager.connection_status().unwrap(),
+                ConnectionState::Crashed { .. }
+            ) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("Xray crash watcher did not update connection state");
     }
 }
