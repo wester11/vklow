@@ -15,19 +15,30 @@ use void_desktop_lib::core::{
 const HELPER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() {
-    if cfg!(debug_assertions)
-        && env::args()
+    if cfg!(debug_assertions) {
+        let stress_cycles = if env::args()
             .skip(1)
             .any(|argument| argument == "--stress-full-ipv4")
-    {
-        match run_full_ipv4_stress() {
-            Ok(result) => println!("{result}"),
-            Err(error) => {
-                eprintln!("VOID full IPv4 stress failed: {error:?}");
-                process::exit(1);
+        {
+            Some(10)
+        } else if env::args()
+            .skip(1)
+            .any(|argument| argument == "--stress-3-full-ipv4")
+        {
+            Some(3)
+        } else {
+            None
+        };
+        if let Some(cycles) = stress_cycles {
+            match run_full_ipv4_stress(cycles) {
+                Ok(result) => println!("{result}"),
+                Err(error) => {
+                    eprintln!("VOID full IPv4 stress failed: {error:?}");
+                    process::exit(1);
+                }
             }
+            return;
         }
-        return;
     }
     match run() {
         Ok(result) => println!("{result}"),
@@ -46,11 +57,9 @@ fn main() {
 /// Development-only reliability harness. Every iteration intentionally invokes
 /// the same per-session controller/UAC/helper path as production; it does not
 /// turn the helper into a service or accept any extra privileged operation.
-fn run_full_ipv4_stress() -> Result<String, ElevationError> {
-    for cycle in 1..=10 {
-        // Let Wintun/Xray finish releasing the preceding adapter object before
-        // beginning the next independent UAC session.
-        thread::sleep(Duration::from_secs(2));
+fn run_full_ipv4_stress(cycles: u8) -> Result<String, ElevationError> {
+    for cycle in 1..=cycles {
+        wait_for_network_quiescence()?;
         run()?;
         let app_data = env::var_os("APPDATA")
             .map(std::path::PathBuf::from)
@@ -64,12 +73,53 @@ fn run_full_ipv4_stress() -> Result<String, ElevationError> {
         {
             return Err(ElevationError::LaunchFailed);
         }
-        println!("full_ipv4_stress_cycle={cycle}/10 clean");
+        println!("full_ipv4_stress_cycle={cycle}/{cycles} clean");
     }
-    Ok("full_ipv4_stress=10/10 clean".into())
+    Ok(format!("full_ipv4_stress={cycles}/{cycles} clean"))
+}
+
+/// Polls observable owned state rather than sleeping an arbitrary amount between
+/// sessions. Wintun may retain an inert driver object, but an active adapter DNS
+/// configuration, an owned route, or a journal is never acceptable here.
+fn wait_for_network_quiescence() -> Result<(), ElevationError> {
+    let app_data = env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .ok_or(ElevationError::LaunchFailed)?
+        .join("com.void.desktop");
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(20) {
+        let routes_clear = full_ipv4_routes()
+            .map_err(|_| ElevationError::LaunchFailed)?
+            .iter()
+            .all(Option::is_none);
+        let adapters = void_tun_adapters().map_err(|_| ElevationError::LaunchFailed)?;
+        // A Wintun object may legitimately remain registered by its driver, but
+        // it must not retain an active TUN DNS assignment between sessions.
+        let adapter_dns_clear = adapters
+            .iter()
+            .all(|adapter| adapter.dns_servers.is_empty());
+        let physical_default_ok = !physical_default_routes()
+            .map_err(|_| ElevationError::LaunchFailed)?
+            .is_empty();
+        if routes_clear
+            && adapter_dns_clear
+            && physical_default_ok
+            && !app_data.join("tun-session.json").exists()
+            && https_check().is_ok()
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    eprintln!(
+        "stress quiescence timeout after {}ms",
+        started.elapsed().as_millis()
+    );
+    Err(ElevationError::LaunchFailed)
 }
 
 fn run() -> Result<String, ElevationError> {
+    stress_phase("CycleStarted");
     let abort_after_route = cfg!(debug_assertions)
         && env::args()
             .skip(1)
@@ -91,12 +141,14 @@ fn run() -> Result<String, ElevationError> {
         return Err(ElevationError::LaunchFailed);
     }
     let dns_before = physical_dns_snapshot().map_err(|_| ElevationError::LaunchFailed)?;
+    stress_phase("BaselineSnapshotCaptured");
     let app_data = env::var_os("APPDATA")
         .map(std::path::PathBuf::from)
         .ok_or(ElevationError::LaunchFailed)?
         .join("com.void.desktop");
-    let baseline = https_check().map_err(|_| ElevationError::LaunchFailed)?;
-    let hostname_baseline = https_hostname_check().map_err(|_| ElevationError::LaunchFailed)?;
+    let baseline = retry_transient("baseline IP HTTPS", https_check)?;
+    let hostname_baseline = retry_transient("baseline hostname HTTPS", https_hostname_check)?;
+    stress_phase("BaselineConnectivityPassed");
     let core = XrayCoreManager::load(app_data.clone());
     core.install_pinned_experimental_tun()
         .map_err(|_| ElevationError::LaunchFailed)?;
@@ -110,6 +162,7 @@ fn run() -> Result<String, ElevationError> {
     let pipe_name = format!(r"\\.\pipe\void-tun-{session_id}");
     let server = TunPipeServer::create(&pipe_name).map_err(|_| ElevationError::LaunchFailed)?;
     let current_exe = env::current_exe().map_err(|_| ElevationError::InvalidHelperLayout)?;
+    stress_phase("HelperLaunchRequested");
     let helper = launch_elevated_helper(
         &current_exe,
         &pipe_name,
@@ -130,10 +183,12 @@ fn run() -> Result<String, ElevationError> {
             return Err(ElevationError::LaunchFailed);
         }
     };
+    stress_phase("PipeConnected");
     if pipe.peer_pid() != helper_pid {
         helper.terminate_if_owned();
         return Err(ElevationError::LaunchFailed);
     }
+    stress_phase("PipeAuthenticated");
     let request = TunRequest {
         protocol_version: IPC_PROTOCOL_VERSION,
         session_id: session_id.clone(),
@@ -173,6 +228,7 @@ fn run() -> Result<String, ElevationError> {
     {
         return Err(ElevationError::LaunchFailed);
     }
+    stress_phase("XrayAndTunReady");
     let route_during = if full_ipv4 {
         let [first, second] = full_ipv4_routes().map_err(|_| ElevationError::LaunchFailed)?;
         let first = first.ok_or(ElevationError::LaunchFailed)?;
@@ -191,6 +247,7 @@ fn run() -> Result<String, ElevationError> {
             .map_err(|_| ElevationError::LaunchFailed)?
             .ok_or(ElevationError::LaunchFailed)?
     };
+    stress_phase("BothRoutesObserved");
     if has_default_route_on(route_during.interface_index)
         .map_err(|_| ElevationError::LaunchFailed)?
     {
@@ -206,6 +263,7 @@ fn run() -> Result<String, ElevationError> {
         let _ = stop_session(&mut pipe, &request, &session_id, controller_pid, helper_pid);
         return Err(error);
     }
+    stress_phase("PhysicalDnsVerified");
     if test_crash_helper {
         helper.terminate_if_owned();
         drop(pipe);
@@ -289,15 +347,17 @@ fn run() -> Result<String, ElevationError> {
             format_dns_adapters(&dns_during.void_tun_dns),
         ));
     }
-    let through_tun = https_check().map_err(|_| ElevationError::LaunchFailed)?;
-    let hostname_through_tun = https_hostname_check().map_err(|_| ElevationError::LaunchFailed)?;
-    let udp_resolution = system_dns_udp_check().map_err(|_| ElevationError::LaunchFailed)?;
+    let through_tun = retry_transient("TUN IP HTTPS", https_check)?;
+    let hostname_through_tun = retry_transient("TUN hostname HTTPS", https_hostname_check)?;
+    let udp_resolution = retry_transient("TUN system DNS", system_dns_udp_check)?;
+    stress_phase("ConnectivityPassed");
     let interface_after = interface_metadata(route_during.interface_index)
         .map_err(|_| ElevationError::LaunchFailed)?;
     let stopped = stop_session(&mut pipe, &request, &session_id, controller_pid, helper_pid)?;
     if !stopped.ok || stopped.state != "stopped" || stopped.helper_pid != helper_pid {
         return Err(ElevationError::LaunchFailed);
     }
+    stress_phase("StoppingCompleted");
     let route_after = scoped_smoke_route().map_err(|_| ElevationError::LaunchFailed)?;
     let full_routes_after = full_ipv4_routes().map_err(|_| ElevationError::LaunchFailed)?;
     if (!full_ipv4 && route_after != route_before)
@@ -307,8 +367,9 @@ fn run() -> Result<String, ElevationError> {
     }
     let dns_after = physical_dns_snapshot().map_err(|_| ElevationError::LaunchFailed)?;
     dns_equality_result(&dns_before, &dns_after)?;
-    let after = https_check().map_err(|_| ElevationError::LaunchFailed)?;
-    let hostname_after = https_hostname_check().map_err(|_| ElevationError::LaunchFailed)?;
+    let after = retry_transient("post-cleanup IP HTTPS", https_check)?;
+    let hostname_after = retry_transient("post-cleanup hostname HTTPS", https_hostname_check)?;
+    stress_phase("CycleCompleted");
     Ok(format!(
         "TUN smoke: mode={} controller_pid={controller_pid} helper_pid={helper_pid} pipe_client_pid={} pipe_server_pid={controller_pid} adapter_alias={} adapter_index={} adapter_luid={} tun_delta_in={} tun_delta_out={} route_before={:?} route_during={:?} route_after={:?} full_routes_before={full_routes_before:?} full_routes_after={full_routes_after:?} dns_before={} dns_during={} dns_after={} void_tun_dns_during={} dns_equality=equal https_ip_before={baseline} https_ip_tun={through_tun} https_ip_after={after} https_hostname_before={hostname_baseline} https_hostname_tun={hostname_through_tun} https_hostname_after={hostname_after} udp_system_resolution={udp_resolution}",
         if full_ipv4 { "full_ipv4" } else { "scoped" },
@@ -326,6 +387,38 @@ fn run() -> Result<String, ElevationError> {
         format_dns(&dns_after),
         format_dns_adapters(&dns_during.void_tun_dns),
     ))
+}
+
+fn stress_phase(phase: &str) {
+    if env::args()
+        .skip(1)
+        .any(|argument| argument == "--stress-full-ipv4")
+    {
+        println!("stress_phase={phase}");
+    }
+}
+
+fn retry_transient<T>(
+    label: &str,
+    check: impl Fn() -> Result<T, String>,
+) -> Result<T, ElevationError> {
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        match check() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 3 {
+                    thread::sleep(Duration::from_millis(250 * attempt));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "{label} failed after bounded retries: {}",
+        last_error.unwrap_or_default()
+    );
+    Err(ElevationError::LaunchFailed)
 }
 
 fn dns_equality_result(
