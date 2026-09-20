@@ -1,5 +1,6 @@
 use std::{env, process, sync::mpsc, thread, time::Duration};
 use void_desktop_lib::core::{
+    network::{has_default_route_on, scoped_smoke_route},
     tun_launcher::{launch_elevated_helper, ElevationError},
     tun_pipe::TunPipeServer,
     tun_protocol::{TunOperation, TunRequest, TunResponse, IPC_PROTOCOL_VERSION},
@@ -20,6 +21,7 @@ fn main() {
 }
 
 fn run() -> Result<String, ElevationError> {
+    let route_before = scoped_smoke_route().map_err(|_| ElevationError::LaunchFailed)?;
     let app_data = env::var_os("APPDATA")
         .map(std::path::PathBuf::from)
         .ok_or(ElevationError::LaunchFailed)?
@@ -88,6 +90,14 @@ fn run() -> Result<String, ElevationError> {
     if response.state != "scoped_tun_running" {
         return Err(ElevationError::LaunchFailed);
     }
+    let route_during = scoped_smoke_route()
+        .map_err(|_| ElevationError::LaunchFailed)?
+        .ok_or(ElevationError::LaunchFailed)?;
+    if has_default_route_on(route_during.interface_index)
+        .map_err(|_| ElevationError::LaunchFailed)?
+    {
+        return Err(ElevationError::LaunchFailed);
+    }
     let through_tun = https_check().map_err(|_| ElevationError::LaunchFailed)?;
     let stop = TunRequest {
         protocol_version: IPC_PROTOCOL_VERSION,
@@ -108,10 +118,17 @@ fn run() -> Result<String, ElevationError> {
     if !stopped.ok || stopped.state != "stopped" || stopped.helper_pid != helper_pid {
         return Err(ElevationError::LaunchFailed);
     }
+    let route_after = scoped_smoke_route().map_err(|_| ElevationError::LaunchFailed)?;
+    if route_after != route_before {
+        return Err(ElevationError::LaunchFailed);
+    }
     let after = https_check().map_err(|_| ElevationError::LaunchFailed)?;
     Ok(format!(
-        "Scoped TUN smoke: controller_pid={controller_pid} helper_pid={helper_pid} pipe_client_pid={} pipe_server_pid={controller_pid} https_before={baseline} https_tun={through_tun} https_after={after}",
+        "Scoped TUN smoke: controller_pid={controller_pid} helper_pid={helper_pid} pipe_client_pid={} pipe_server_pid={controller_pid} route_before={:?} route_during={:?} route_after={:?} https_before={baseline} https_tun={through_tun} https_after={after}",
         pipe.peer_pid(),
+        route_before,
+        route_during,
+        route_after,
     ))
 }
 

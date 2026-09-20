@@ -1,4 +1,5 @@
 pub mod diagnostics;
+pub mod network;
 pub mod secrets;
 pub mod tun;
 pub mod tun_launcher;

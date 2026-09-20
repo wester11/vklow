@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 use void_desktop_lib::core::{
+    network::{has_default_route_on, scoped_smoke_route},
     tun::{TunSessionJournal, TunSessionPhase},
     tun_pipe::TunPipeConnection,
     tun_protocol::{TunOperation, TunRequest, TunResponse},
@@ -184,12 +185,43 @@ fn start_tun(bootstrap: &Bootstrap) -> Result<OwnedTunSession, String> {
         let _ = fs::remove_file(&journal_path);
         return Err("Experimental Xray exited before TUN readiness".into());
     }
-    Ok(OwnedTunSession {
+    let mut session = OwnedTunSession {
         child,
         config,
         journal_path,
         journal,
-    })
+    };
+    if let Err(error) = wait_for_scoped_route(&mut session) {
+        let _ = session.stop();
+        return Err(error);
+    }
+    Ok(session)
+}
+
+fn wait_for_scoped_route(session: &mut OwnedTunSession) -> Result<(), String> {
+    for _ in 0..30 {
+        if session
+            .child
+            .try_wait()
+            .map_err(|_| "Unable to inspect owned Xray")?
+            .is_some()
+        {
+            return Err("Experimental Xray exited before scoped route readiness".into());
+        }
+        if let Some(route) = scoped_smoke_route()? {
+            if has_default_route_on(route.interface_index)? {
+                return Err("Unexpected VOID default route detected".into());
+            }
+            session.journal.interface_index = Some(route.interface_index);
+            session
+                .journal
+                .transition(TunSessionPhase::ScopedRouteReady);
+            session.journal.save_atomic(&session.journal_path)?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err("Scoped 1.1.1.1/32 route did not appear".into())
 }
 
 fn parse_bootstrap(arguments: Vec<String>) -> Result<Bootstrap, String> {
