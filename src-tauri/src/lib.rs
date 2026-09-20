@@ -58,6 +58,10 @@ fn get_connection_status(state: State<'_, AppState>) -> Result<ConnectionState, 
     state.core.connection_status()
 }
 #[tauri::command]
+fn install_core(state: State<'_, AppState>) -> Result<CoreStatus, String> {
+    state.core.install_latest_official()
+}
+#[tauri::command]
 async fn add_subscription(url: String, state: State<'_, AppState>) -> Result<ImportResult, String> {
     let source = Url::parse(&url).map_err(|_| "Укажите корректный URL подписки")?;
     let name = source
@@ -176,6 +180,7 @@ pub fn run() {
             get_snapshot,
             get_core_status,
             get_connection_status,
+            install_core,
             add_subscription,
             import_uri,
             select_server,

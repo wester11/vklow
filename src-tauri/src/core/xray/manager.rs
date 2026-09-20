@@ -5,6 +5,7 @@ use crate::{
         integrity::{parse_dgst_for_asset, verify_sha256},
         paths::XrayPaths,
         redaction::redact,
+        release::{acquire, resolve_windows_x64, trusted_client},
         state::InstalledState,
         version::XrayVersion,
     },
@@ -161,6 +162,20 @@ impl XrayCoreManager {
         }
         result?;
         Ok(self.status())
+    }
+    pub fn install_latest_official(&self) -> Result<CoreStatus, String> {
+        let client = trusted_client()?;
+        let release = resolve_windows_x64(&client)?;
+        let staging = self
+            .paths
+            .staging()
+            .join(format!("download-{}", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let (archive, digest) = acquire(&release, &staging)?;
+            self.install_verified_core(&archive, &digest, release.version)
+        })();
+        let _ = fs::remove_dir_all(staging);
+        result
     }
     pub fn connect(&self, server: &Server) -> Result<ConnectionState, String> {
         let gen = {

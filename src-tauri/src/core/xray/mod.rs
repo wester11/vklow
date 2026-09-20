@@ -4,5 +4,6 @@ pub mod integrity;
 pub mod manager;
 pub mod paths;
 pub mod redaction;
+pub mod release;
 pub mod state;
 pub mod version;
