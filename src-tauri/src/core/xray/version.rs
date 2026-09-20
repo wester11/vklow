@@ -1,5 +1,42 @@
 use std::{fmt, str::FromStr};
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)] pub struct XrayVersion { pub year: u16, pub month: u8, pub day: u8 }
-impl FromStr for XrayVersion { type Err = String; fn from_str(raw: &str) -> Result<Self, Self::Err> { let raw = raw.strip_prefix('v').unwrap_or(raw); let fields: Vec<_> = raw.split('.').collect(); if fields.len() != 3 { return Err("Версия Xray должна иметь формат vYY.M.D".into()); } let year = fields[0].parse().map_err(|_| "Некорректный год версии")?; let month: u8 = fields[1].parse().map_err(|_| "Некорректный месяц версии")?; let day: u8 = fields[2].parse().map_err(|_| "Некорректный день версии")?; if !(1..=12).contains(&month) || !(1..=31).contains(&day) { return Err("Версия Xray вне допустимого диапазона".into()); } Ok(Self { year, month, day }) } }
-impl fmt::Display for XrayVersion { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "v{}.{}.{}", self.year, self.month, self.day) } }
-#[cfg(test)] mod tests { use super::*; #[test] fn validates_calver() { assert_eq!("v26.9.8".parse::<XrayVersion>().unwrap().to_string(), "v26.9.8"); assert!("v26.13.8".parse::<XrayVersion>().is_err()); assert!("release-latest".parse::<XrayVersion>().is_err()); } }
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct XrayVersion {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+}
+impl FromStr for XrayVersion {
+    type Err = String;
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let raw = raw.strip_prefix('v').unwrap_or(raw);
+        let fields: Vec<_> = raw.split('.').collect();
+        if fields.len() != 3 {
+            return Err("Версия Xray должна иметь формат vYY.M.D".into());
+        }
+        let year = fields[0].parse().map_err(|_| "Некорректный год версии")?;
+        let month: u8 = fields[1].parse().map_err(|_| "Некорректный месяц версии")?;
+        let day: u8 = fields[2].parse().map_err(|_| "Некорректный день версии")?;
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            return Err("Версия Xray вне допустимого диапазона".into());
+        }
+        Ok(Self { year, month, day })
+    }
+}
+impl fmt::Display for XrayVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "v{}.{}.{}", self.year, self.month, self.day)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn validates_calver() {
+        assert_eq!(
+            "v26.9.8".parse::<XrayVersion>().unwrap().to_string(),
+            "v26.9.8"
+        );
+        assert!("v26.13.8".parse::<XrayVersion>().is_err());
+        assert!("release-latest".parse::<XrayVersion>().is_err());
+    }
+}
