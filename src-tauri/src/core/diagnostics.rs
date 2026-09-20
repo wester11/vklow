@@ -84,6 +84,7 @@ mod tests {
                 install_state: CoreInstallState::Failed,
                 active_version: None,
                 previous_version: None,
+                experimental_tun_version: None,
                 last_error: Some(values.join(" ")),
             },
             connection: ConnectionState::Error {

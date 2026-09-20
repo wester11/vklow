@@ -1,4 +1,4 @@
-use crate::core::xray::version::XrayVersion;
+use crate::core::xray::{release::XrayReleaseChannel, version::XrayVersion};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -9,6 +9,8 @@ pub struct InstalledState {
     pub previous_version: Option<String>,
     pub installed_versions: Vec<String>,
     pub failed_versions: Vec<String>,
+    #[serde(default)]
+    pub experimental_tun_version: Option<String>,
 }
 impl InstalledState {
     pub fn activate(&mut self, version: XrayVersion) {
@@ -18,6 +20,24 @@ impl InstalledState {
         }
         if !self.installed_versions.contains(&value) {
             self.installed_versions.push(value);
+        }
+    }
+    pub fn activate_channel(&mut self, version: XrayVersion, channel: XrayReleaseChannel) {
+        match channel {
+            XrayReleaseChannel::Stable => self.activate(version),
+            XrayReleaseChannel::ExperimentalTun => {
+                let value = version.to_string();
+                self.experimental_tun_version = Some(value.clone());
+                if !self.installed_versions.contains(&value) {
+                    self.installed_versions.push(value);
+                }
+            }
+        }
+    }
+    pub fn version_for(&self, channel: XrayReleaseChannel) -> Option<&str> {
+        match channel {
+            XrayReleaseChannel::Stable => self.active_version.as_deref(),
+            XrayReleaseChannel::ExperimentalTun => self.experimental_tun_version.as_deref(),
         }
     }
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -51,5 +71,19 @@ mod tests {
         state.activate("v26.4.1".parse().unwrap());
         assert_eq!(state.active_version.as_deref(), Some("v26.4.1"));
         assert_eq!(state.previous_version.as_deref(), Some("v26.3.27"));
+    }
+    #[test]
+    fn keeps_experimental_tun_separate_from_stable() {
+        let mut state = InstalledState::default();
+        state.activate("v26.3.27".parse().unwrap());
+        state.activate_channel(
+            "v26.9.8".parse().unwrap(),
+            XrayReleaseChannel::ExperimentalTun,
+        );
+        assert_eq!(state.active_version.as_deref(), Some("v26.3.27"));
+        assert_eq!(
+            state.version_for(XrayReleaseChannel::ExperimentalTun),
+            Some("v26.9.8")
+        );
     }
 }

@@ -5,7 +5,10 @@ use crate::{
         integrity::{parse_dgst_for_asset, verify_sha256},
         paths::XrayPaths,
         redaction::redact,
-        release::{acquire, resolve_windows_x64, trusted_client},
+        release::{
+            acquire, resolve_pinned_experimental_tun, resolve_windows_x64, trusted_client,
+            OfficialRelease, XrayReleaseChannel,
+        },
         state::InstalledState,
         version::XrayVersion,
     },
@@ -40,6 +43,7 @@ pub struct CoreStatus {
     pub install_state: CoreInstallState,
     pub active_version: Option<String>,
     pub previous_version: Option<String>,
+    pub experimental_tun_version: Option<String>,
     pub last_error: Option<String>,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -116,6 +120,7 @@ impl XrayCoreManager {
             },
             active_version: valid.then(|| state.active_version.clone()).flatten(),
             previous_version: state.previous_version.clone(),
+            experimental_tun_version: state.experimental_tun_version.clone(),
             last_error: self
                 .last_error
                 .lock()
@@ -135,8 +140,14 @@ impl XrayCoreManager {
         self.paths.root().join("diagnostics")
     }
     pub fn validate_tun_capability(&self) -> TunCapabilityStatus {
+        self.validate_tun_capability_for(XrayReleaseChannel::Stable)
+    }
+    pub fn validate_experimental_tun_capability(&self) -> TunCapabilityStatus {
+        self.validate_tun_capability_for(XrayReleaseChannel::ExperimentalTun)
+    }
+    fn validate_tun_capability_for(&self, channel: XrayReleaseChannel) -> TunCapabilityStatus {
         let result = (|| {
-            let binary = self.active_binary()?;
+            let binary = self.binary_for(channel)?;
             let wintun = binary.with_file_name("wintun.dll");
             if !wintun.is_file() {
                 return Err(
@@ -168,7 +179,7 @@ impl XrayCoreManager {
                 TunCapabilityStatus {
                     supported: elevation_required,
                     wintun_present: self
-                        .active_binary()
+                        .binary_for(channel)
                         .ok()
                         .is_some_and(|binary| binary.with_file_name("wintun.dll").is_file()),
                     elevation_required,
@@ -182,6 +193,23 @@ impl XrayCoreManager {
         artifact: &Path,
         dgst: &str,
         version: XrayVersion,
+    ) -> Result<CoreStatus, String> {
+        self.install_verified_for_channel(artifact, dgst, version, XrayReleaseChannel::Stable)
+    }
+    fn install_verified_release(
+        &self,
+        artifact: &Path,
+        dgst: &str,
+        release: OfficialRelease,
+    ) -> Result<CoreStatus, String> {
+        self.install_verified_for_channel(artifact, dgst, release.version, release.channel)
+    }
+    fn install_verified_for_channel(
+        &self,
+        artifact: &Path,
+        dgst: &str,
+        version: XrayVersion,
+        channel: XrayReleaseChannel,
     ) -> Result<CoreStatus, String> {
         let expected = parse_dgst_for_asset(dgst, "Xray-windows-64.zip")?;
         let bytes = fs::read(artifact).map_err(|_| "Не удалось прочитать Xray artifact")?;
@@ -208,7 +236,7 @@ impl XrayCoreManager {
                 .state
                 .lock()
                 .map_err(|_| "Внутренняя ошибка Xray state")?;
-            state.activate(version);
+            state.activate_channel(version, channel);
             state.save_atomic(&self.paths.state())
         })();
         if result.is_err() {
@@ -226,7 +254,21 @@ impl XrayCoreManager {
             .join(format!("download-{}", uuid::Uuid::new_v4()));
         let result = (|| {
             let (archive, digest) = acquire(&release, &staging)?;
-            self.install_verified_core(&archive, &digest, release.version)
+            self.install_verified_release(&archive, &digest, release)
+        })();
+        let _ = fs::remove_dir_all(staging);
+        result
+    }
+    pub fn install_pinned_experimental_tun(&self) -> Result<CoreStatus, String> {
+        let client = trusted_client()?;
+        let release = resolve_pinned_experimental_tun(&client)?;
+        let staging = self
+            .paths
+            .staging()
+            .join(format!("download-{}", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let (archive, digest) = acquire(&release, &staging)?;
+            self.install_verified_release(&archive, &digest, release)
         })();
         let _ = fs::remove_dir_all(staging);
         result
@@ -241,13 +283,25 @@ impl XrayCoreManager {
     }
     #[cfg(test)]
     fn connect_freedom_for_test(&self) -> Result<ConnectionState, String> {
+        self.connect_freedom_for_channel_for_test(XrayReleaseChannel::Stable)
+    }
+    #[cfg(test)]
+    fn connect_freedom_experimental_tun_for_test(&self) -> Result<ConnectionState, String> {
+        self.connect_freedom_for_channel_for_test(XrayReleaseChannel::ExperimentalTun)
+    }
+    #[cfg(test)]
+    fn connect_freedom_for_channel_for_test(
+        &self,
+        channel: XrayReleaseChannel,
+    ) -> Result<ConnectionState, String> {
         let gen = self.begin_connect()?;
         let port = Self::allocate_port()?;
-        let result = self.start_config(
+        let result = self.start_config_for_channel(
             gen,
             port,
             crate::core::xray::config::loopback_freedom_socks(port),
             Vec::new(),
+            channel,
         );
         if let Err(error) = &result {
             self.fail(gen, error);
@@ -281,7 +335,17 @@ impl XrayCoreManager {
         config: serde_json::Value,
         secrets: Vec<String>,
     ) -> Result<ConnectionState, String> {
-        let binary = self.active_binary()?;
+        self.start_config_for_channel(gen, port, config, secrets, XrayReleaseChannel::Stable)
+    }
+    fn start_config_for_channel(
+        &self,
+        gen: u64,
+        port: u16,
+        config: serde_json::Value,
+        secrets: Vec<String>,
+        channel: XrayReleaseChannel,
+    ) -> Result<ConnectionState, String> {
+        let binary = self.binary_for(channel)?;
         let path = self.paths.runtime().join(format!("xray-{gen}.json"));
         fs::write(
             &path,
@@ -358,15 +422,20 @@ impl XrayCoreManager {
         runtime.connection = ConnectionState::Idle;
         Ok(ConnectionState::Idle)
     }
-    fn active_binary(&self) -> Result<PathBuf, String> {
+    pub fn experimental_tun_binary(&self) -> Result<PathBuf, String> {
+        self.binary_for(XrayReleaseChannel::ExperimentalTun)
+    }
+    fn binary_for(&self, channel: XrayReleaseChannel) -> Result<PathBuf, String> {
         let state = self
             .state
             .lock()
             .map_err(|_| "Внутренняя ошибка Xray state")?;
         let version: XrayVersion = state
-            .active_version
-            .as_deref()
-            .ok_or("Xray не установлен")?
+            .version_for(channel)
+            .ok_or(match channel {
+                XrayReleaseChannel::Stable => "Stable Xray не установлен",
+                XrayReleaseChannel::ExperimentalTun => "Experimental TUN Xray не установлен",
+            })?
             .parse()?;
         let binary = self.paths.binary(&version);
         binary
@@ -542,12 +611,14 @@ impl XrayCoreManager {
     }
     fn allocate_port() -> Result<u16, String> {
         for _ in 0..32 {
-            let listener = TcpListener::bind(("127.0.0.1", 0))
-                .map_err(|_| "Не удалось выделить loopback SOCKS port")?;
-            let port = listener
-                .local_addr()
-                .map_err(|_| "Не удалось определить loopback SOCKS port")?
-                .port();
+            let port = {
+                let listener = TcpListener::bind(("127.0.0.1", 0))
+                    .map_err(|_| "Не удалось выделить loopback SOCKS port")?;
+                listener
+                    .local_addr()
+                    .map_err(|_| "Не удалось определить loopback SOCKS port")?
+                    .port()
+            };
             if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
                 return Ok(port);
             }
@@ -737,6 +808,80 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
         }
         panic!("Xray crash watcher did not update connection state");
+    }
+    #[test]
+    fn pinned_experimental_tun_core_preserves_proxy_runtime_when_enabled() {
+        if std::env::var_os("VOID_XRAY_EXPERIMENTAL_INTEGRATION").is_none() {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("void-xray-experimental-{}", uuid::Uuid::new_v4()));
+        let manager = XrayCoreManager::load(root);
+        let status = manager
+            .install_pinned_experimental_tun()
+            .expect("pinned verified experimental Xray installation failed");
+        assert_eq!(status.active_version, None);
+        assert_eq!(status.experimental_tun_version.as_deref(), Some("v26.9.8"));
+        let capability = manager.validate_experimental_tun_capability();
+        assert!(capability.wintun_present, "{:?}", capability.message);
+        assert!(capability.supported, "{:?}", capability.message);
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let origin = listener.local_addr().unwrap();
+        let token = format!("void-experimental-{}", uuid::Uuid::new_v4());
+        let expected = token.clone();
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    expected.len(),
+                    expected
+                )
+                .unwrap();
+            }
+        });
+        for _ in 0..2 {
+            let ConnectionState::ProxyReady { socks_port } =
+                manager.connect_freedom_experimental_tun_for_test().unwrap()
+            else {
+                panic!("experimental proxy was not ready")
+            };
+            let client = reqwest::blocking::Client::builder()
+                .proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}")).unwrap())
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+            assert_eq!(
+                client
+                    .get(format!("http://{origin}/"))
+                    .send()
+                    .unwrap()
+                    .text()
+                    .unwrap(),
+                token
+            );
+            assert!(matches!(
+                manager.disconnect().unwrap(),
+                ConnectionState::Idle
+            ));
+        }
+
+        manager.connect_freedom_experimental_tun_for_test().unwrap();
+        manager.terminate_owned_process_for_test().unwrap();
+        for _ in 0..30 {
+            if matches!(
+                manager.connection_status().unwrap(),
+                ConnectionState::Crashed { .. }
+            ) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("Experimental Xray crash watcher did not update connection state");
     }
     fn install_test_core(manager: &XrayCoreManager) -> bool {
         if std::env::var_os("VOID_XRAY_INTEGRATION").is_some() {

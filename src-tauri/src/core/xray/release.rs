@@ -13,14 +13,23 @@ use std::{
 use url::Url;
 
 const API: &str = "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=20";
+const EXPERIMENTAL_TUN_TAG: &str = "v26.9.8";
 pub const ARCHIVE_NAME: &str = "Xray-windows-64.zip";
 pub const DIGEST_NAME: &str = "Xray-windows-64.zip.dgst";
 const MAX_ARCHIVE: u64 = 64 * 1024 * 1024;
 const MAX_DIGEST: u64 = 64 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XrayReleaseChannel {
+    Stable,
+    ExperimentalTun,
+}
+
 #[derive(Clone, Debug)]
 pub struct OfficialRelease {
     pub version: XrayVersion,
+    pub channel: XrayReleaseChannel,
     pub archive: Url,
     pub digest: Url,
     pub asset_name: String,
@@ -66,6 +75,45 @@ pub fn resolve_windows_x64(client: &Client) -> Result<OfficialRelease, String> {
     };
     Ok(OfficialRelease {
         version,
+        channel: XrayReleaseChannel::Stable,
+        archive: asset(ARCHIVE_NAME)?,
+        digest: asset(DIGEST_NAME)?,
+        asset_name: ARCHIVE_NAME.into(),
+    })
+}
+
+pub fn resolve_pinned_experimental_tun(client: &Client) -> Result<OfficialRelease, String> {
+    if !cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        return Err("UnsupportedPlatform: требуется Windows x86_64".into());
+    }
+    let response = client
+        .get(format!(
+            "https://api.github.com/repos/XTLS/Xray-core/releases/tags/{EXPERIMENTAL_TUN_TAG}"
+        ))
+        .header("User-Agent", "VOID-Desktop")
+        .send()
+        .map_err(|_| "Не удалось получить pinned experimental Xray release")?;
+    if !response.status().is_success() {
+        return Err("Pinned experimental Xray release недоступен".into());
+    }
+    let release: GithubRelease = response
+        .json()
+        .map_err(|_| "Некорректный ответ experimental Xray release API")?;
+    if release.tag_name != EXPERIMENTAL_TUN_TAG || release.draft || !release.prerelease {
+        return Err("Pinned experimental Xray release не соответствует TUN policy".into());
+    }
+    let version = release.tag_name.parse()?;
+    let asset = |name: &str| -> Result<Url, String> {
+        let item = release
+            .assets
+            .iter()
+            .find(|item| item.name == name)
+            .ok_or("В pinned experimental release отсутствует ожидаемый Windows x64 asset")?;
+        trusted_url(&item.browser_download_url)
+    };
+    Ok(OfficialRelease {
+        version,
+        channel: XrayReleaseChannel::ExperimentalTun,
         archive: asset(ARCHIVE_NAME)?,
         digest: asset(DIGEST_NAME)?,
         asset_name: ARCHIVE_NAME.into(),
