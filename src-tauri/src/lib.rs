@@ -2,8 +2,13 @@ pub mod core;
 pub mod domain;
 mod subscription;
 use chrono::Utc;
-use core::secrets::{subscription_url_key, SecretStore, WindowsSecretStore};
 use core::xray::manager::{CoreStatus, XrayCoreManager};
+use core::{
+    diagnostics::{
+        export as export_diagnostics_file, process_state, socks_listen, DiagnosticsSnapshot,
+    },
+    secrets::{subscription_url_key, SecretStore, WindowsSecretStore},
+};
 use domain::{AppSnapshot, ConnectionState, Server, Subscription};
 use std::sync::Mutex;
 use tauri::{Manager, State};
@@ -62,6 +67,57 @@ fn get_connection_status(state: State<'_, AppState>) -> Result<ConnectionState, 
 #[tauri::command]
 fn install_core(state: State<'_, AppState>) -> Result<CoreStatus, String> {
     state.core.install_latest_official()
+}
+#[tauri::command]
+fn get_diagnostics(state: State<'_, AppState>) -> Result<DiagnosticsSnapshot, String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния")?;
+    let selected = runtime
+        .selected_server_id
+        .as_ref()
+        .and_then(|id| {
+            runtime
+                .servers
+                .iter()
+                .find(|server| &server.summary.id == id)
+        })
+        .or_else(|| runtime.servers.first());
+    Ok(DiagnosticsSnapshot {
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        core: state.core.status(),
+        process_state: process_state(&runtime.connection),
+        socks_listen: socks_listen(&runtime.connection),
+        connection: runtime.connection.clone(),
+        selected_server_id: selected.map(|server| server.summary.id.clone()),
+        protocol: selected.map(|server| server.summary.protocol),
+        transport: selected.and_then(|server| server.summary.transport.clone()),
+        subscription_count: runtime.subscriptions.len(),
+        last_subscription_status: "last_known_good".into(),
+        internet_check: "unknown".into(),
+        proxy_ip: None,
+    })
+}
+#[tauri::command]
+fn export_diagnostics(state: State<'_, AppState>) -> Result<String, String> {
+    let snapshot = get_diagnostics(state.clone())?;
+    let path = state.core.diagnostics_directory().join("exports");
+    let secrets = state
+        .runtime
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния")?
+        .servers
+        .iter()
+        .flat_map(|server| {
+            std::iter::once(server.credential.clone()).chain(server.options.values().cloned())
+        })
+        .collect::<Vec<_>>();
+    let file = export_diagnostics_file(&snapshot, &path, &secrets)?;
+    file.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "Не удалось определить diagnostics export".to_owned())
 }
 #[tauri::command]
 async fn add_subscription(url: String, state: State<'_, AppState>) -> Result<ImportResult, String> {
@@ -185,6 +241,8 @@ pub fn run() {
             get_snapshot,
             get_core_status,
             get_connection_status,
+            get_diagnostics,
+            export_diagnostics,
             install_core,
             add_subscription,
             import_uri,

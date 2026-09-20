@@ -123,6 +123,9 @@ impl XrayCoreManager {
             .connection
             .clone())
     }
+    pub fn diagnostics_directory(&self) -> PathBuf {
+        self.paths.root().join("diagnostics")
+    }
     pub fn install_verified_core(
         &self,
         artifact: &Path,
