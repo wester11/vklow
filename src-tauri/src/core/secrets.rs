@@ -7,6 +7,11 @@ pub trait SecretStore: Send + Sync {
 }
 
 pub struct WindowsSecretStore;
+impl Default for WindowsSecretStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl WindowsSecretStore {
     pub fn new() -> Self {
         Self
