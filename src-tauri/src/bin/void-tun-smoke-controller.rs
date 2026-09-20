@@ -15,6 +15,20 @@ use void_desktop_lib::core::{
 const HELPER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() {
+    if cfg!(debug_assertions)
+        && env::args()
+            .skip(1)
+            .any(|argument| argument == "--stress-full-ipv4")
+    {
+        match run_full_ipv4_stress() {
+            Ok(result) => println!("{result}"),
+            Err(error) => {
+                eprintln!("VOID full IPv4 stress failed: {error:?}");
+                process::exit(1);
+            }
+        }
+        return;
+    }
     match run() {
         Ok(result) => println!("{result}"),
         Err(ElevationError::ElevationCancelled) => println!("ElevationCancelled"),
@@ -27,6 +41,32 @@ fn main() {
             process::exit(1);
         }
     }
+}
+
+/// Development-only reliability harness. Every iteration intentionally invokes
+/// the same per-session controller/UAC/helper path as production; it does not
+/// turn the helper into a service or accept any extra privileged operation.
+fn run_full_ipv4_stress() -> Result<String, ElevationError> {
+    for cycle in 1..=10 {
+        // Let Wintun/Xray finish releasing the preceding adapter object before
+        // beginning the next independent UAC session.
+        thread::sleep(Duration::from_secs(2));
+        run()?;
+        let app_data = env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .ok_or(ElevationError::LaunchFailed)?
+            .join("com.void.desktop");
+        if app_data.join("tun-session.json").exists()
+            || full_ipv4_routes()
+                .map_err(|_| ElevationError::LaunchFailed)?
+                .iter()
+                .any(Option::is_some)
+        {
+            return Err(ElevationError::LaunchFailed);
+        }
+        println!("full_ipv4_stress_cycle={cycle}/10 clean");
+    }
+    Ok("full_ipv4_stress=10/10 clean".into())
 }
 
 fn run() -> Result<String, ElevationError> {
