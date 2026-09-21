@@ -1,7 +1,7 @@
 use crate::{
     core::xray::{
         archive::extract_verified_zip,
-        config::{tun_capability_config, vless_reality_tcp, VlessRealityOutbound},
+        config::{tun_capability_config, vless_reality_outbound, VlessRealityOutbound},
         integrity::{parse_dgst_for_asset, verify_sha256},
         paths::XrayPaths,
         redaction::redact,
@@ -450,25 +450,28 @@ impl XrayCoreManager {
             .ok_or_else(|| "Активный Xray binary отсутствует; требуется переустановка".into())
     }
     fn config_for(&self, s: &Server, port: u16) -> Result<serde_json::Value, String> {
+        let outbound = Self::outbound_for(s)?;
+        Ok(
+            serde_json::json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"udp":true}}],"outbounds":[outbound]}),
+        )
+    }
+    pub fn outbound_for(s: &Server) -> Result<serde_json::Value, String> {
         if !matches!(s.summary.protocol, Protocol::Vless)
             || s.security.as_deref() != Some("reality")
         {
             return Err("В этом этапе runtime поддерживает только VLESS Reality TCP".into());
         }
         let option = |key| s.options.get(key).cloned().unwrap_or_default();
-        vless_reality_tcp(
-            &VlessRealityOutbound {
-                address: s.summary.address.clone(),
-                port: s.summary.port,
-                uuid: s.credential.clone(),
-                flow: s.options.get("flow").cloned(),
-                server_name: s.sni.clone().unwrap_or_else(|| option("sni")),
-                fingerprint: option("fp"),
-                public_key: option("pbk"),
-                short_id: option("sid"),
-            },
-            port,
-        )
+        vless_reality_outbound(&VlessRealityOutbound {
+            address: s.summary.address.clone(),
+            port: s.summary.port,
+            uuid: s.credential.clone(),
+            flow: s.options.get("flow").cloned(),
+            server_name: s.sni.clone().unwrap_or_else(|| option("sni")),
+            fingerprint: option("fp"),
+            public_key: option("pbk"),
+            short_id: option("sid"),
+        })
     }
     fn validate(binary: &Path, config: &Path, secrets: &[String]) -> Result<(), String> {
         let mut child = Command::new(binary)

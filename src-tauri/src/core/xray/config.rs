@@ -37,6 +37,15 @@ pub fn vless_reality_tcp(
     input: &VlessRealityOutbound,
     socks_port: u16,
 ) -> Result<serde_json::Value, String> {
+    let outbound = vless_reality_outbound(input)?;
+    Ok(
+        serde_json::json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":socks_port,"protocol":"socks","settings":{"udp":true}}],"outbounds":[outbound]}),
+    )
+}
+
+/// Backend-only common production outbound. It deliberately has no knowledge
+/// of SOCKS, TUN, frontend input or any runtime filesystem location.
+pub fn vless_reality_outbound(input: &VlessRealityOutbound) -> Result<serde_json::Value, String> {
     if input.address.is_empty() || input.server_name.is_empty() || input.public_key.is_empty() {
         return Err("Reality-конфигурация неполная".into());
     }
@@ -49,7 +58,7 @@ pub fn vless_reality_tcp(
         );
     }
     Ok(
-        serde_json::json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":socks_port,"protocol":"socks","settings":{"udp":true}}],"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":input.address,"port":input.port,"users":[{"id":input.uuid,"encryption":"none","flow":input.flow}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":input.server_name,"fingerprint":input.fingerprint,"password":input.public_key,"shortId":input.short_id}}}]}),
+        serde_json::json!({"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":input.address,"port":input.port,"users":[{"id":input.uuid,"encryption":"none","flow":input.flow}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":input.server_name,"fingerprint":input.fingerprint,"password":input.public_key,"shortId":input.short_id}}}),
     )
 }
 pub fn loopback_freedom_socks(socks_port: u16) -> serde_json::Value {
@@ -145,6 +154,38 @@ pub fn full_ipv4_freedom_config(adapter_name: &str) -> Result<serde_json::Value,
     })
     .map_err(|_| "Не удалось сериализовать full IPv4 TUN config".into())
 }
+
+pub fn full_ipv4_tun_config(
+    adapter_name: &str,
+    outbound: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if adapter_name.len() > 96 || adapter_name.is_empty() {
+        return Err("Недопустимое имя VOID TUN adapter".into());
+    }
+    serde_json::to_value(TunValidationConfig {
+        inbounds: vec![TunInbound {
+            port: 0,
+            protocol: "tun",
+            settings: TunInboundSettings {
+                name: adapter_name.into(),
+                desc: "VOID Experimental System VPN IPv4".into(),
+                mtu: 1500,
+                gateway: vec!["198.18.0.1/30".into()],
+                dns: FULL_IPV4_TUN_DNS
+                    .iter()
+                    .map(|value| (*value).into())
+                    .collect(),
+                auto_system_routing_table: FULL_IPV4_ROUTES
+                    .iter()
+                    .map(|value| (*value).into())
+                    .collect(),
+                auto_outbounds_interface: "auto".into(),
+            },
+        }],
+        outbounds: vec![outbound],
+    })
+    .map_err(|_| "Не удалось сериализовать System VPN TUN config".into())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +246,23 @@ mod tests {
             settings["autoSystemRoutingTable"],
             serde_json::json!(["0.0.0.0/0"])
         );
+    }
+    #[test]
+    fn proxy_and_system_vpn_use_the_same_server_outbound() {
+        let server = VlessRealityOutbound {
+            address: "edge.example".into(),
+            port: 443,
+            uuid: "11111111-1111-1111-1111-111111111111".into(),
+            flow: Some("xtls-rprx-vision".into()),
+            server_name: "www.example.com".into(),
+            fingerprint: "chrome".into(),
+            public_key: "public".into(),
+            short_id: "aabb".into(),
+        };
+        let outbound = vless_reality_outbound(&server).unwrap();
+        let proxy = vless_reality_tcp(&server, 32145).unwrap();
+        let tun = full_ipv4_tun_config("VOID Tunnel fixture", outbound.clone()).unwrap();
+        assert_eq!(proxy["outbounds"][0], outbound);
+        assert_eq!(tun["outbounds"][0], proxy["outbounds"][0]);
     }
 }

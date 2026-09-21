@@ -190,17 +190,16 @@ fn connect(state: State<'_, AppState>) -> Result<(), String> {
             .runtime
             .lock()
             .map_err(|_| "Внутренняя ошибка состояния")?;
-        if runtime.servers.is_empty() {
-            return Err("Сначала добавьте подписку или URI сервера".into());
-        }
-        let selected = runtime.selected_server_id.as_ref();
+        let selected = runtime
+            .selected_server_id
+            .as_ref()
+            .ok_or("NoServerSelected")?;
         runtime
             .servers
             .iter()
-            .find(|item| Some(&item.summary.id) == selected)
-            .or_else(|| runtime.servers.first())
+            .find(|item| &item.summary.id == selected)
             .cloned()
-            .ok_or("Выбранный сервер больше недоступен")?
+            .ok_or("SelectedServerUnavailable")?
     };
     let connection = state.core.connect(&server)?;
     let mut runtime = state
