@@ -124,6 +124,41 @@ impl SystemVpnController {
             Err(ElevationError::LaunchFailed)
         }
     }
+
+    /// Test-only fail-open verification. The helper terminates only the child
+    /// process it created and tracks; no process-name lookup is involved.
+    #[cfg(feature = "dev-tools")]
+    pub fn terminate_owned_core_for_development(&mut self) -> Result<(), ElevationError> {
+        let request = TunRequest {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            session_id: self.session_id.clone(),
+            nonce: self.nonce.clone(),
+            controller_pid: self.controller_pid,
+            helper_pid: self.helper_pid,
+            operation: TunOperation::TestCrashOwnedCore,
+            system_vpn: None,
+        };
+        self.pipe
+            .write_frame(&serde_json::to_vec(&request).map_err(|_| ElevationError::LaunchFailed)?)
+            .map_err(|_| ElevationError::LaunchFailed)?;
+        let response: TunResponse = serde_json::from_slice(
+            &self
+                .pipe
+                .read_frame()
+                .map_err(|_| ElevationError::LaunchFailed)?,
+        )
+        .map_err(|_| ElevationError::LaunchFailed)?;
+        if response.ok
+            && response.state == "owned_core_crash_recovered"
+            && response.session_id == self.session_id
+            && response.controller_pid == self.controller_pid
+            && response.helper_pid == self.helper_pid
+        {
+            Ok(())
+        } else {
+            Err(ElevationError::LaunchFailed)
+        }
+    }
 }
 
 impl Drop for SystemVpnController {

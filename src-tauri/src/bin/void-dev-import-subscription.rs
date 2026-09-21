@@ -8,11 +8,24 @@ use sha2::Digest;
 use std::{
     fs,
     io::{self, Read},
+    net::{IpAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{self, Command},
+    time::Duration,
 };
 use void_desktop_lib::{
-    core::secrets::WindowsSecretStore,
+    core::{
+        network::{
+            compare_physical_dns, full_ipv4_routes, has_default_route_on, interface_metadata,
+            physical_default_routes, physical_dns_snapshot, void_tun_adapters,
+            PhysicalDnsComparison, PhysicalDnsSnapshot,
+        },
+        secrets::WindowsSecretStore,
+        system_vpn::SystemVpnSessionSpec,
+        system_vpn_controller::SystemVpnController,
+        tun::TunSessionJournal,
+        xray::{config::FULL_IPV4_TUN_DNS, manager::XrayCoreManager},
+    },
     domain::{Protocol, Server},
     subscription::import_https_subscription,
 };
@@ -20,11 +33,20 @@ use zeroize::Zeroize;
 
 const MAX_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RunMode {
+    ImportOnly,
+    Phase2,
+}
+
 fn main() {
-    if !args_are_safe() {
-        eprintln!("usage: void-dev-import-subscription < stdin");
-        process::exit(2);
-    }
+    let mode = match run_mode() {
+        Some(mode) => mode,
+        None => {
+            eprintln!("usage: void-dev-import-subscription [--phase2] < stdin");
+            process::exit(2);
+        }
+    };
     let mut source = match read_one_secret_line() {
         Ok(value) => value,
         Err(()) => {
@@ -38,10 +60,8 @@ fn main() {
         &WindowsSecretStore::new(),
     ));
     match result {
-        Ok(imported) => {
-            let leak_check = leak_check(&source, repo_root(), app_runtime_root());
-            source.zeroize();
-            if let Err(kind) = leak_check {
+        Ok(mut imported) => {
+            if let Err(kind) = leak_check(&source, repo_root(), app_runtime_root()) {
                 // Do not emit a path or matched content: a filename can itself
                 // be sensitive, and this tool's result is consumed by automation.
                 eprintln!("leak_detected type={kind}");
@@ -57,11 +77,32 @@ fn main() {
                 imported.servers.len()
             );
             for server in &imported.servers {
-                println!("{}", safe_server_line(server));
+                println!(
+                    "{} system_vpn={}",
+                    safe_server_line(server),
+                    system_vpn_support(server)
+                );
+            }
+            if mode == RunMode::Phase2 {
+                if let Err(stage) = run_real_phase2(&imported.servers) {
+                    eprintln!("phase2_failed stage={stage}");
+                    scrub_servers(&mut imported.servers);
+                    source.zeroize();
+                    process::exit(1);
+                }
+                println!("phase2=passed");
+            }
+            if let Err(kind) = leak_check(&source, repo_root(), app_runtime_root()) {
+                eprintln!("leak_detected type={kind}");
+                scrub_servers(&mut imported.servers);
+                source.zeroize();
+                process::exit(1);
             }
             // The digest is intentionally retained only long enough to prove
             // it was computed; never print or persist a subscription fingerprint.
             let _ = fingerprint;
+            scrub_servers(&mut imported.servers);
+            source.zeroize();
             println!("secretstore=stored leak_check=clean git_worktree=clean");
         }
         Err(_) => {
@@ -72,8 +113,277 @@ fn main() {
     }
 }
 
-fn args_are_safe() -> bool {
-    std::env::args_os().count() == 1
+fn run_mode() -> Option<RunMode> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] => Some(RunMode::ImportOnly),
+        [argument] if argument == "--phase2" => Some(RunMode::Phase2),
+        _ => None,
+    }
+}
+
+fn system_vpn_support(server: &Server) -> &'static str {
+    SystemVpnSessionSpec::from_selected_server(server)
+        .map(|_| "eligible")
+        .unwrap_or("unsupported")
+}
+
+fn scrub_servers(servers: &mut [Server]) {
+    for server in servers {
+        server.credential.zeroize();
+        server.security.as_mut().map(Zeroize::zeroize);
+        server.sni.as_mut().map(Zeroize::zeroize);
+        for value in server.options.values_mut() {
+            value.zeroize();
+        }
+        server.options.clear();
+    }
+}
+
+/// Explicit development selection only. Production commands still require a
+/// user-selected ID and return NoServerSelected otherwise.
+fn select_development_phase2_server(servers: &[Server]) -> Result<&Server, &'static str> {
+    servers
+        .iter()
+        .find(|server| system_vpn_support(server) == "eligible")
+        .ok_or("NoSupportedServerForSystemVpn")
+}
+
+fn run_real_phase2(servers: &[Server]) -> Result<(), &'static str> {
+    let server = select_development_phase2_server(servers)?;
+    println!(
+        "selected server_id={} protocol={} transport={}",
+        server.summary.id,
+        protocol_name(server.summary.protocol),
+        server
+            .summary
+            .transport
+            .as_deref()
+            .map(safe_display)
+            .unwrap_or_else(|| "unknown".into())
+    );
+    let app_data = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("com.void.desktop"))
+        .ok_or("AppDataUnavailable")?;
+    let core = XrayCoreManager::load(app_data.clone());
+    core.install_pinned_experimental_tun()
+        .map_err(|_| "PinnedCoreInstallFailed")?;
+    run_live_cycle(server, &core, &app_data, false)?;
+    run_live_cycle(server, &core, &app_data, false)?;
+    run_live_cycle(server, &core, &app_data, true)?;
+    Ok(())
+}
+
+fn run_live_cycle(
+    server: &Server,
+    core: &XrayCoreManager,
+    app_data: &Path,
+    crash_owned_core: bool,
+) -> Result<(), &'static str> {
+    let baseline = NetworkBaseline::capture()?;
+    let spec = SystemVpnSessionSpec::from_selected_server(server).map_err(|_| "SpecBuildFailed")?;
+    core.preflight_system_vpn(&spec)
+        .map_err(|_| "PreUacValidationFailed")?;
+    println!(
+        "pre_uac_validation=passed server_id={} protocol={} transport={}",
+        spec.selected_server_id,
+        protocol_name(server.summary.protocol),
+        server
+            .summary
+            .transport
+            .as_deref()
+            .map(safe_display)
+            .unwrap_or_else(|| "unknown".into())
+    );
+    let session_id = spec.session_id.clone();
+    let mut controller = SystemVpnController::start(spec).map_err(|_| "UacOrHelperStartFailed")?;
+    let outcome = (|| {
+        let [first, second] = full_ipv4_routes().map_err(|_| "RouteInspectionFailed")?;
+        let (Some(first), Some(second)) = (first, second) else {
+            return Err("FullIpv4RoutesMissing");
+        };
+        if first.interface_index != second.interface_index
+            || has_default_route_on(first.interface_index).map_err(|_| "RouteInspectionFailed")?
+            || physical_default_routes()
+                .map_err(|_| "RouteInspectionFailed")?
+                .is_empty()
+        {
+            return Err("RoutePolicyFailed");
+        }
+        let interface_before =
+            interface_metadata(first.interface_index).map_err(|_| "TunCounterReadFailed")?;
+        let dns_during = physical_dns_snapshot().map_err(|_| "PhysicalDnsReadFailed")?;
+        if compare_physical_dns(&baseline.physical_dns, &dns_during) != PhysicalDnsComparison::Equal
+        {
+            return Err("PhysicalDnsChanged");
+        }
+        let tun_dns_ok = void_tun_adapters()
+            .map_err(|_| "TunDnsReadFailed")?
+            .iter()
+            .any(|adapter| {
+                adapter.friendly_name == interface_before.alias
+                    && adapter.dns_servers == FULL_IPV4_TUN_DNS
+            });
+        if !tun_dns_ok {
+            return Err("TunDnsPolicyFailed");
+        }
+        let journal = TunSessionJournal::load(&core.tun_journal_path())
+            .map_err(|_| "JournalReadFailed")?
+            .ok_or("JournalMissing")?;
+        if journal.selected_server_id.as_deref() != Some(server.summary.id.as_str())
+            || journal.config_sha256.as_deref().is_none()
+        {
+            return Err("SelectedOutboundEvidenceFailed");
+        }
+        let vpn_ip = direct_public_ip()?;
+        let hostname_status = direct_hostname_https()?;
+        let resolver_count = system_dns_count()?;
+        let interface_after =
+            interface_metadata(first.interface_index).map_err(|_| "TunCounterReadFailed")?;
+        if interface_after.in_octets <= interface_before.in_octets
+            && interface_after.out_octets <= interface_before.out_octets
+        {
+            return Err("TunTrafficCounterDidNotAdvance");
+        }
+        println!(
+            "vpn_ready public_ip={} hostname_https={} system_dns={} tun_rx_delta={} tun_tx_delta={} outbound_tag=proxy outbound_protocol=vless",
+            vpn_ip,
+            hostname_status,
+            resolver_count,
+            interface_after.in_octets.saturating_sub(interface_before.in_octets),
+            interface_after.out_octets.saturating_sub(interface_before.out_octets),
+        );
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = controller.stop();
+        drop(controller);
+        let _ = verify_cleanup(&baseline, app_data, &session_id, core);
+        return outcome;
+    }
+    if crash_owned_core {
+        controller
+            .terminate_owned_core_for_development()
+            .map_err(|_| "OwnedCoreCrashRecoveryFailed")?;
+        println!("fail_open=owned_core_terminated");
+    } else {
+        controller.stop().map_err(|_| "DisconnectFailed")?;
+    }
+    drop(controller);
+    verify_cleanup(&baseline, app_data, &session_id, core)?;
+    println!(
+        "disconnect_cleanup=passed direct_public_ip_after={}",
+        direct_public_ip()?
+    );
+    Ok(())
+}
+
+struct NetworkBaseline {
+    physical_dns: PhysicalDnsSnapshot,
+}
+
+impl NetworkBaseline {
+    fn capture() -> Result<Self, &'static str> {
+        let physical_dns = physical_dns_snapshot().map_err(|_| "PhysicalDnsReadFailed")?;
+        if physical_default_routes()
+            .map_err(|_| "RouteInspectionFailed")?
+            .is_empty()
+        {
+            return Err("PhysicalDefaultRouteMissing");
+        }
+        let direct_ip = direct_public_ip()?;
+        let hostname = direct_hostname_https()?;
+        println!(
+            "baseline direct_public_ip={} hostname_https={hostname}",
+            direct_ip
+        );
+        Ok(Self { physical_dns })
+    }
+}
+
+fn verify_cleanup(
+    baseline: &NetworkBaseline,
+    app_data: &Path,
+    session_id: &str,
+    core: &XrayCoreManager,
+) -> Result<(), &'static str> {
+    if full_ipv4_routes()
+        .map_err(|_| "RouteInspectionFailed")?
+        .iter()
+        .any(Option::is_some)
+        || core.tun_journal_path().exists()
+        || app_data
+            .join("xray")
+            .join("runtime")
+            .join("system-vpn")
+            .join(session_id)
+            .exists()
+    {
+        return Err("RuntimeCleanupFailed");
+    }
+    let observed_dns = physical_dns_snapshot().map_err(|_| "PhysicalDnsReadFailed")?;
+    if compare_physical_dns(&baseline.physical_dns, &observed_dns) != PhysicalDnsComparison::Equal {
+        return Err("PhysicalDnsChanged");
+    }
+    if !void_tun_adapters()
+        .map_err(|_| "TunDnsReadFailed")?
+        .iter()
+        .all(|adapter| adapter.dns_servers.is_empty())
+    {
+        return Err("TunDnsCleanupFailed");
+    }
+    if physical_default_routes()
+        .map_err(|_| "RouteInspectionFailed")?
+        .is_empty()
+    {
+        return Err("PhysicalDefaultRouteMissing");
+    }
+    let _ = direct_hostname_https()?;
+    Ok(())
+}
+
+fn direct_public_ip() -> Result<String, &'static str> {
+    let response = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| "PublicIpClientFailed")?
+        .get("https://api.ipify.org")
+        .send()
+        .map_err(|_| "PublicIpRequestFailed")?;
+    if !response.status().is_success() {
+        return Err("PublicIpStatusFailed");
+    }
+    let body = response.text().map_err(|_| "PublicIpBodyFailed")?;
+    body.trim()
+        .parse::<IpAddr>()
+        .map(|address| address.to_string())
+        .map_err(|_| "PublicIpMalformed")
+}
+
+fn direct_hostname_https() -> Result<u16, &'static str> {
+    let response = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| "HostnameClientFailed")?
+        .get("https://www.cloudflare.com/cdn-cgi/trace")
+        .send()
+        .map_err(|_| "HostnameRequestFailed")?;
+    response
+        .status()
+        .is_success()
+        .then_some(response.status().as_u16())
+        .ok_or("HostnameStatusFailed")
+}
+
+fn system_dns_count() -> Result<usize, &'static str> {
+    ("www.cloudflare.com", 443)
+        .to_socket_addrs()
+        .map_err(|_| "SystemDnsFailed")
+        .map(|addresses| addresses.filter(|address| address.is_ipv4()).count())
+        .and_then(|count| (count > 0).then_some(count).ok_or("SystemDnsNoIpv4"))
 }
 
 fn read_one_secret_line() -> Result<String, ()> {
