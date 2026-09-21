@@ -1,13 +1,12 @@
 pub mod core;
 pub mod domain;
-mod subscription;
-use chrono::Utc;
+pub mod subscription;
 use core::xray::manager::{CoreStatus, TunCapabilityStatus, XrayCoreManager};
 use core::{
     diagnostics::{
         export as export_diagnostics_file, process_state, socks_listen, DiagnosticsSnapshot,
     },
-    secrets::{subscription_url_key, SecretStore, WindowsSecretStore},
+    secrets::{SecretStore, WindowsSecretStore},
     system_vpn::SystemVpnSessionSpec,
     system_vpn_controller::SystemVpnController,
     tun_launcher::ElevationError,
@@ -15,7 +14,6 @@ use core::{
 use domain::{AppSnapshot, ConnectionState, Server, Subscription};
 use std::sync::Mutex;
 use tauri::{Manager, State};
-use url::Url;
 use uuid::Uuid;
 
 struct RuntimeState {
@@ -129,26 +127,14 @@ fn export_diagnostics(state: State<'_, AppState>) -> Result<String, String> {
 }
 #[tauri::command]
 async fn add_subscription(url: String, state: State<'_, AppState>) -> Result<ImportResult, String> {
-    let source = Url::parse(&url).map_err(|_| "Укажите корректный URL подписки")?;
-    let name = source
-        .host_str()
-        .ok_or("В URL подписки отсутствует хост")?
-        .to_owned();
-    let servers = subscription::fetch_and_parse(&url).await?;
-    let count = servers.len();
-    let id = Uuid::new_v4().to_string();
-    state.secrets.set(&subscription_url_key(&id), &url)?;
+    let imported = subscription::import_https_subscription(&url, state.secrets.as_ref()).await?;
+    let count = imported.servers.len();
     let mut runtime = state
         .runtime
         .lock()
         .map_err(|_| "Внутренняя ошибка состояния")?;
-    runtime.servers.extend(servers);
-    runtime.subscriptions.push(Subscription {
-        id,
-        name,
-        updated_at: Utc::now().to_rfc3339(),
-        server_count: count,
-    });
+    runtime.servers.extend(imported.servers);
+    runtime.subscriptions.push(imported.subscription);
     Ok(ImportResult {
         server_count: count,
     })
@@ -381,3 +367,4 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running VOID Desktop");
 }
+use chrono::Utc;

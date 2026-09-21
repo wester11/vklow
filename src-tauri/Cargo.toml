@@ -6,6 +6,8 @@ version = "0.1.0"
 description = "VOID Desktop VPN client"
 authors = ["VOID"]
 edition = "2021"
+[features]
+dev-tools = []
 [[bin]]
 name = "void-desktop"
 path = "src/main.rs"
@@ -15,6 +17,10 @@ path = "src/bin/void-tun-helper.rs"
 [[bin]]
 name = "void-tun-smoke-controller"
 path = "src/bin/void-tun-smoke-controller.rs"
+[[bin]]
+name = "void-dev-import-subscription"
+path = "src/bin/void-dev-import-subscription.rs"
+required-features = ["dev-tools"]
 [lib]
 name = "void_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
