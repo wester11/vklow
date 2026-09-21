@@ -1,5 +1,5 @@
 use serde::Serialize;
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunInboundSettings {
     pub name: String,
@@ -157,9 +157,14 @@ pub fn full_ipv4_freedom_config(adapter_name: &str) -> Result<serde_json::Value,
 
 pub fn full_ipv4_tun_config(
     adapter_name: &str,
-    outbound: serde_json::Value,
+    outbound: &VlessRealityOutbound,
 ) -> Result<serde_json::Value, String> {
-    if adapter_name.len() > 96 || adapter_name.is_empty() {
+    if adapter_name.len() > 96
+        || adapter_name.is_empty()
+        || !adapter_name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, ' ' | '-'))
+    {
         return Err("Недопустимое имя VOID TUN adapter".into());
     }
     serde_json::to_value(TunValidationConfig {
@@ -182,7 +187,7 @@ pub fn full_ipv4_tun_config(
                 auto_outbounds_interface: "auto".into(),
             },
         }],
-        outbounds: vec![outbound],
+        outbounds: vec![vless_reality_outbound(outbound)?],
     })
     .map_err(|_| "Не удалось сериализовать System VPN TUN config".into())
 }
@@ -259,10 +264,12 @@ mod tests {
             public_key: "public".into(),
             short_id: "aabb".into(),
         };
-        let outbound = vless_reality_outbound(&server).unwrap();
         let proxy = vless_reality_tcp(&server, 32145).unwrap();
-        let tun = full_ipv4_tun_config("VOID Tunnel fixture", outbound.clone()).unwrap();
-        assert_eq!(proxy["outbounds"][0], outbound);
+        let tun = full_ipv4_tun_config("VOID Tunnel fixture", &server).unwrap();
+        assert_eq!(
+            proxy["outbounds"][0],
+            vless_reality_outbound(&server).unwrap()
+        );
         assert_eq!(tun["outbounds"][0], proxy["outbounds"][0]);
     }
 }

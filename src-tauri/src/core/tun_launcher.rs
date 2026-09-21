@@ -21,6 +21,10 @@ pub struct ElevatedHelper {
     pub pid: u32,
 }
 
+// The handle is only accessed through the owning controller's mutex and is
+// closed exactly once in Drop.
+unsafe impl Send for ElevatedHelper {}
+
 impl ElevatedHelper {
     pub fn terminate_if_owned(&self) {
         unsafe { TerminateProcess(self.handle, 1) };

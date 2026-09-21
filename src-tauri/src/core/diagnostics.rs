@@ -46,8 +46,9 @@ pub fn process_state(connection: &ConnectionState) -> String {
         ConnectionState::Preparing
         | ConnectionState::ValidatingConfig
         | ConnectionState::StartingCore
-        | ConnectionState::WaitingForProxy => "starting",
-        ConnectionState::ProxyReady { .. } => "running",
+        | ConnectionState::WaitingForProxy
+        | ConnectionState::SystemVpnStarting => "starting",
+        ConnectionState::ProxyReady { .. } | ConnectionState::SystemVpnConnected => "running",
         ConnectionState::Stopping => "stopping",
         ConnectionState::Crashed { .. } => "crashed",
         ConnectionState::Error { .. } => "error",

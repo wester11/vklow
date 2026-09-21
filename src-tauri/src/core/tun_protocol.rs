@@ -1,3 +1,4 @@
+use crate::core::system_vpn::SystemVpnSessionSpec;
 use serde::{Deserialize, Serialize};
 
 pub const IPC_PROTOCOL_VERSION: u8 = 1;
@@ -8,6 +9,7 @@ pub const MAX_IPC_MESSAGE_BYTES: usize = 4096;
 pub enum TunOperation {
     StartScopedTunSession,
     StartFullIpv4Experimental,
+    StartSystemVpnSession,
     StopTunSession,
     QueryTunSession,
     RecoverTunSession,
@@ -15,7 +17,7 @@ pub enum TunOperation {
     TestCrashOwnedCore,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TunRequest {
     pub protocol_version: u8,
@@ -24,6 +26,8 @@ pub struct TunRequest {
     pub controller_pid: u32,
     pub helper_pid: u32,
     pub operation: TunOperation,
+    #[serde(default)]
+    pub system_vpn: Option<SystemVpnSessionSpec>,
 }
 
 impl TunRequest {
@@ -48,6 +52,17 @@ impl TunRequest {
         }
         if request.controller_pid == 0 || request.helper_pid == 0 {
             return Err("Invalid TUN IPC process identity".into());
+        }
+        match request.operation {
+            TunOperation::StartSystemVpnSession => request
+                .system_vpn
+                .as_ref()
+                .ok_or("MissingSystemVpnSessionSpec")?
+                .validate()?,
+            _ if request.system_vpn.is_some() => {
+                return Err("UnexpectedSystemVpnSessionSpec".into())
+            }
+            _ => {}
         }
         Ok(request)
     }
@@ -115,6 +130,7 @@ mod tests {
             controller_pid: 42,
             helper_pid: 43,
             operation,
+            system_vpn: None,
         })
         .unwrap()
     }
@@ -155,5 +171,57 @@ mod tests {
             NONCE,
         )
         .is_err());
+    }
+
+    #[test]
+    fn rejects_system_vpn_start_without_a_valid_typed_spec() {
+        let bytes = serde_json::to_vec(&TunRequest {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            session_id: SESSION.into(),
+            nonce: NONCE.into(),
+            controller_pid: 42,
+            helper_pid: 43,
+            operation: TunOperation::StartSystemVpnSession,
+            system_vpn: None,
+        })
+        .unwrap();
+        assert_eq!(
+            TunRequest::decode(&bytes, SESSION, NONCE).err().unwrap(),
+            "MissingSystemVpnSessionSpec"
+        );
+    }
+
+    #[test]
+    fn typed_system_vpn_request_fits_the_bounded_pipe() {
+        let spec = SystemVpnSessionSpec {
+            spec_version: 1,
+            session_id: SESSION.into(),
+            selected_server_id: "11111111-1111-1111-1111-111111111111".into(),
+            mode: crate::core::system_vpn::SystemVpnMode::SystemIpv4Experimental,
+            outbound: crate::core::system_vpn::SystemVpnOutbound::VlessRealityTcp(
+                crate::core::system_vpn::VlessRealityTcpSpec {
+                    address: "edge.example".into(),
+                    port: 443,
+                    uuid: "22222222-2222-2222-2222-222222222222".into(),
+                    flow: Some("xtls-rprx-vision".into()),
+                    server_name: "www.example.com".into(),
+                    fingerprint: "chrome".into(),
+                    public_key: "public-fixture".into(),
+                    short_id: "aabb".into(),
+                },
+            ),
+        };
+        let bytes = serde_json::to_vec(&TunRequest {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            session_id: SESSION.into(),
+            nonce: NONCE.into(),
+            controller_pid: 42,
+            helper_pid: 43,
+            operation: TunOperation::StartSystemVpnSession,
+            system_vpn: Some(spec),
+        })
+        .unwrap();
+        assert!(bytes.len() < MAX_IPC_MESSAGE_BYTES);
+        assert!(TunRequest::decode(&bytes, SESSION, NONCE).is_ok());
     }
 }

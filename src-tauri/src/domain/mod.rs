@@ -55,6 +55,8 @@ pub enum ConnectionState {
     ValidatingConfig,
     StartingCore,
     WaitingForProxy,
+    SystemVpnStarting,
+    SystemVpnConnected,
     #[serde(rename = "connected")]
     ProxyReady {
         socks_port: u16,

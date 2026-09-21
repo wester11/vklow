@@ -10,6 +10,8 @@ use void_desktop_lib::core::{
         full_ipv4_routes, has_default_route_on, interface_metadata, physical_default_routes,
         scoped_smoke_route, void_tun_adapters,
     },
+    private_runtime::create_owner_only_directory,
+    system_vpn::{SystemVpnSessionSpec, PINNED_EXPERIMENTAL_TUN_VERSION},
     tun::{OwnedRoute, TunSessionJournal, TunSessionPhase, TunSessionPolicy},
     tun_pipe::TunPipeConnection,
     tun_protocol::{TunOperation, TunRequest, TunResponse},
@@ -49,13 +51,16 @@ fn run() -> Result<(), String> {
     if pipe.peer_pid() != bootstrap.controller_pid {
         return Err("TUN controller PID mismatch".into());
     }
-    let request = TunRequest::decode(&pipe.read_frame()?, &bootstrap.session_id, &bootstrap.nonce)?;
+    let mut request =
+        TunRequest::decode(&pipe.read_frame()?, &bootstrap.session_id, &bootstrap.nonce)?;
     if request.controller_pid != bootstrap.controller_pid || request.helper_pid != helper_pid {
         return Err("TUN IPC process identity mismatch".into());
     }
     if !matches!(
         request.operation,
-        TunOperation::StartScopedTunSession | TunOperation::StartFullIpv4Experimental
+        TunOperation::StartScopedTunSession
+            | TunOperation::StartFullIpv4Experimental
+            | TunOperation::StartSystemVpnSession
     ) {
         let response = TunResponse::rejected(
             bootstrap.session_id.clone(),
@@ -69,7 +74,8 @@ fn run() -> Result<(), String> {
         return Err("Rejected TUN helper operation".into());
     }
     let full_ipv4 = request.operation == TunOperation::StartFullIpv4Experimental;
-    let mut session = match start_tun(&bootstrap, full_ipv4) {
+    let system_vpn = request.system_vpn.take();
+    let mut session = match start_tun(&bootstrap, full_ipv4, system_vpn.as_ref()) {
         Ok(session) => session,
         Err(error) => {
             let response = TunResponse::rejected(
@@ -88,7 +94,9 @@ fn run() -> Result<(), String> {
         bootstrap.session_id.clone(),
         bootstrap.controller_pid,
         helper_pid,
-        if full_ipv4 {
+        if system_vpn.is_some() {
+            "system_ipv4_tun_running"
+        } else if full_ipv4 {
             "full_ipv4_tun_running"
         } else {
             "scoped_tun_running"
@@ -154,6 +162,7 @@ struct OwnedTunSession {
     child: std::process::Child,
     _job: OwnedXrayJob,
     config: std::path::PathBuf,
+    config_directory: std::path::PathBuf,
     journal_path: std::path::PathBuf,
     journal: TunSessionJournal,
     manual_routes: Vec<MIB_IPFORWARD_ROW2>,
@@ -176,6 +185,7 @@ impl OwnedTunSession {
             self.child.wait().map_err(|_| "Unable to reap owned Xray")?;
         }
         let _ = fs::remove_file(&self.config);
+        let _ = fs::remove_dir(&self.config_directory);
         self.journal.transition(TunSessionPhase::Completed);
         self.journal.save_atomic(&self.journal_path)?;
         fs::remove_file(&self.journal_path)
@@ -183,13 +193,23 @@ impl OwnedTunSession {
     }
 }
 
-fn start_tun(bootstrap: &Bootstrap, full_ipv4: bool) -> Result<OwnedTunSession, String> {
+fn start_tun(
+    bootstrap: &Bootstrap,
+    full_ipv4: bool,
+    system_vpn: Option<&SystemVpnSessionSpec>,
+) -> Result<OwnedTunSession, String> {
+    if let Some(spec) = system_vpn {
+        spec.validate()?;
+        if spec.session_id != bootstrap.session_id {
+            return Err("SystemVpnSessionMismatch".into());
+        }
+    }
     let app_data = env::var_os("APPDATA")
         .map(std::path::PathBuf::from)
         .ok_or("Unable to resolve VOID app data")?
         .join("com.void.desktop");
     let core = XrayCoreManager::load(app_data);
-    let binary = core.experimental_tun_binary()?;
+    let binary = core.pinned_experimental_tun_binary()?;
     let version_dir = binary
         .parent()
         .ok_or("Invalid experimental Xray location")?
@@ -201,18 +221,24 @@ fn start_tun(bootstrap: &Bootstrap, full_ipv4: bool) -> Result<OwnedTunSession, 
     if !binary.starts_with(&version_dir) || !binary.with_file_name("wintun.dll").is_file() {
         return Err("Verified experimental Xray or Wintun is unavailable".into());
     }
-    let adapter_name = format!("VOID Tunnel {}", &bootstrap.session_id[..8]);
+    let adapter_name = if let Some(spec) = system_vpn {
+        spec.adapter_name()?
+    } else {
+        format!("VOID Tunnel {}", &bootstrap.session_id[..8])
+    };
     let mut journal = TunSessionJournal::new(
         bootstrap.session_id.clone(),
         adapter_name.clone(),
-        "v26.9.8".into(),
-        if full_ipv4 {
+        PINNED_EXPERIMENTAL_TUN_VERSION.into(),
+        if system_vpn.is_some() {
+            TunSessionPolicy::SystemIpv4Experimental
+        } else if full_ipv4 {
             TunSessionPolicy::FullIpv4Experimental
         } else {
             TunSessionPolicy::ScopedSmoke
         },
     );
-    if full_ipv4 {
+    if full_ipv4 || system_vpn.is_some() {
         journal.owned_routes = FULL_IPV4_ROUTES
             .iter()
             .map(|destination| OwnedRoute {
@@ -236,19 +262,43 @@ fn start_tun(bootstrap: &Bootstrap, full_ipv4: bool) -> Result<OwnedTunSession, 
     journal.transition(TunSessionPhase::StartingTun);
     let journal_path = core.tun_journal_path();
     journal.save_atomic(&journal_path)?;
-    let config = core
+    let config_directory = core
         .runtime_directory()
-        .join(format!("tun-{}.json", bootstrap.session_id));
-    fs::write(
-        &config,
-        serde_json::to_vec(&if full_ipv4 {
-            full_ipv4_freedom_config(&adapter_name)?
-        } else {
-            scoped_tun_smoke_config(&adapter_name)?
-        })
-        .map_err(|_| "Unable to serialize TUN config")?,
+        .join("system-vpn")
+        .join(&bootstrap.session_id);
+    fs::create_dir_all(
+        config_directory
+            .parent()
+            .ok_or("Unable to prepare private System VPN runtime")?,
     )
-    .map_err(|_| "Unable to write private TUN runtime config")?;
+    .map_err(|_| "Unable to prepare private System VPN runtime")?;
+    create_owner_only_directory(&config_directory)?;
+    let config = config_directory.join("config.json");
+    let generated_config = if let Some(spec) = system_vpn {
+        journal.selected_server_id = Some(spec.selected_server_id.clone());
+        journal.config_sha256 = Some(spec.config_digest()?);
+        spec.config()?
+    } else if full_ipv4 {
+        full_ipv4_freedom_config(&adapter_name)?
+    } else {
+        scoped_tun_smoke_config(&adapter_name)?
+    };
+    let temporary = config.with_extension("tmp");
+    let write_result = (|| {
+        fs::write(
+            &temporary,
+            serde_json::to_vec(&generated_config).map_err(|_| "Unable to serialize TUN config")?,
+        )
+        .map_err(|_| "Unable to write private TUN runtime config")?;
+        fs::rename(&temporary, &config)
+            .map_err(|_| "Unable to activate private TUN runtime".to_owned())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_dir(&config_directory);
+        let _ = fs::remove_file(&journal_path);
+        return Err(error);
+    }
     let validation = Command::new(&binary)
         .args(["run", "-test", "-c"])
         .arg(&config)
@@ -257,8 +307,9 @@ fn start_tun(bootstrap: &Bootstrap, full_ipv4: bool) -> Result<OwnedTunSession, 
         .map_err(|_| "Unable to validate experimental TUN config")?;
     if !validation.status.success() {
         let _ = fs::remove_file(&config);
+        let _ = fs::remove_dir(&config_directory);
         let _ = fs::remove_file(&journal_path);
-        return Err("Experimental Xray rejected scoped TUN config".into());
+        return Err("Experimental Xray rejected typed TUN config".into());
     }
     let mut child = Command::new(&binary)
         .args(["run", "-c"])
@@ -273,6 +324,9 @@ fn start_tun(bootstrap: &Bootstrap, full_ipv4: bool) -> Result<OwnedTunSession, 
     if let Err(error) = job.assign(&child) {
         let _ = child.kill();
         let _ = child.wait();
+        let _ = fs::remove_file(&config);
+        let _ = fs::remove_dir(&config_directory);
+        let _ = fs::remove_file(&journal_path);
         return Err(error);
     }
     journal.core_pid = Some(child.id());
@@ -284,6 +338,7 @@ fn start_tun(bootstrap: &Bootstrap, full_ipv4: bool) -> Result<OwnedTunSession, 
         .is_some()
     {
         let _ = fs::remove_file(&config);
+        let _ = fs::remove_dir(&config_directory);
         let _ = fs::remove_file(&journal_path);
         return Err("Experimental Xray exited before TUN readiness".into());
     }
@@ -291,15 +346,25 @@ fn start_tun(bootstrap: &Bootstrap, full_ipv4: bool) -> Result<OwnedTunSession, 
         child,
         _job: job,
         config,
+        config_directory,
         journal_path,
         journal,
         manual_routes: Vec::new(),
     };
-    if full_ipv4 {
-        let index = wait_for_owned_adapter(&session.journal.adapter_name)?;
-        session.manual_routes = install_full_ipv4_routes(index)?;
+    if full_ipv4 || system_vpn.is_some() {
+        let routes = (|| {
+            let index = wait_for_owned_adapter(&session.journal.adapter_name)?;
+            install_full_ipv4_routes(index)
+        })();
+        match routes {
+            Ok(routes) => session.manual_routes = routes,
+            Err(error) => {
+                let _ = session.stop();
+                return Err(error);
+            }
+        }
     }
-    if let Err(error) = if full_ipv4 {
+    if let Err(error) = if full_ipv4 || system_vpn.is_some() {
         wait_for_full_ipv4_routes(&mut session)
     } else {
         wait_for_scoped_route(&mut session)

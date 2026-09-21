@@ -21,6 +21,7 @@ pub enum TunSessionPhase {
 pub enum TunSessionPolicy {
     ScopedSmoke,
     FullIpv4Experimental,
+    SystemIpv4Experimental,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +41,11 @@ pub struct TunSessionJournal {
     pub adapter_luid: Option<u64>,
     pub interface_index: Option<u32>,
     pub experimental_version: String,
+    /// Safe server identity and digest only. Credentials never enter this file.
+    #[serde(default)]
+    pub selected_server_id: Option<String>,
+    #[serde(default)]
+    pub config_sha256: Option<String>,
     pub core_pid: Option<u32>,
     pub owned_routes: Vec<OwnedRoute>,
     #[serde(default)]
@@ -54,7 +60,7 @@ impl TunSessionJournal {
         policy: TunSessionPolicy,
     ) -> Self {
         Self {
-            schema_version: 3,
+            schema_version: 4,
             policy,
             session_id,
             started_at: chrono::Utc::now().to_rfc3339(),
@@ -62,6 +68,8 @@ impl TunSessionJournal {
             adapter_luid: None,
             interface_index: None,
             experimental_version,
+            selected_server_id: None,
+            config_sha256: None,
             core_pid: None,
             owned_routes: Vec::new(),
             tun_dns: Vec::new(),
@@ -132,5 +140,23 @@ mod tests {
         assert_eq!(journal.phase, TunSessionPhase::ScopedRouteReady);
         assert_eq!(journal.adapter_luid, Some(42));
         assert_eq!(journal.interface_index, Some(7));
+    }
+    #[test]
+    fn system_vpn_journal_has_no_credential_fields() {
+        let mut journal = TunSessionJournal::new(
+            "11111111-1111-1111-1111-111111111111".into(),
+            "VOID Tunnel 11111111".into(),
+            "v26.9.8".into(),
+            TunSessionPolicy::SystemIpv4Experimental,
+        );
+        journal.selected_server_id = Some("22222222-2222-2222-2222-222222222222".into());
+        journal.config_sha256 = Some("a".repeat(64));
+        let value = serde_json::to_string(&journal).unwrap();
+        for forbidden in ["credential", "password", "privateKey", "publicKey", "uuid"] {
+            assert!(
+                !value.contains(forbidden),
+                "journal must not contain {forbidden}"
+            );
+        }
     }
 }

@@ -8,6 +8,9 @@ use core::{
         export as export_diagnostics_file, process_state, socks_listen, DiagnosticsSnapshot,
     },
     secrets::{subscription_url_key, SecretStore, WindowsSecretStore},
+    system_vpn::SystemVpnSessionSpec,
+    system_vpn_controller::SystemVpnController,
+    tun_launcher::ElevationError,
 };
 use domain::{AppSnapshot, ConnectionState, Server, Subscription};
 use std::sync::Mutex;
@@ -35,6 +38,7 @@ struct AppState {
     runtime: Mutex<RuntimeState>,
     core: XrayCoreManager,
     secrets: Box<dyn SecretStore>,
+    system_vpn: Mutex<Option<SystemVpnController>>,
 }
 fn snapshot(runtime: &RuntimeState) -> AppSnapshot {
     AppSnapshot {
@@ -209,14 +213,131 @@ fn connect(state: State<'_, AppState>) -> Result<(), String> {
     runtime.connection = connection;
     Ok(())
 }
+
+/// Starts the sole experimental full-IPv4 System VPN mode. The frontend sends
+/// no server parameters: the backend resolves the selected normalized server,
+/// validates the exact generated config before UAC, then transfers the closed
+/// typed spec through the authenticated one-shot pipe.
+#[tauri::command]
+fn connect_system_vpn(state: State<'_, AppState>) -> Result<(), String> {
+    if state
+        .system_vpn
+        .lock()
+        .map_err(|_| "SystemVpnStateUnavailable")?
+        .is_some()
+    {
+        return Err("SystemVpnAlreadyRunning".into());
+    }
+    let server = {
+        let runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "Внутренняя ошибка состояния")?;
+        let selected = runtime
+            .selected_server_id
+            .as_ref()
+            .ok_or("NoServerSelected")?;
+        runtime
+            .servers
+            .iter()
+            .find(|item| &item.summary.id == selected)
+            .cloned()
+            .ok_or("SelectedServerUnavailable")?
+    };
+    let spec = SystemVpnSessionSpec::from_selected_server(&server)?;
+    state.core.install_pinned_experimental_tun()?;
+    state.core.preflight_system_vpn(&spec)?;
+    {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "Внутренняя ошибка состояния")?;
+        runtime.connection = ConnectionState::SystemVpnStarting;
+    }
+    let mut controller = match SystemVpnController::start(spec) {
+        Ok(controller) => controller,
+        Err(ElevationError::ElevationCancelled) => {
+            set_runtime_connection(&state, ConnectionState::Idle)?;
+            return Err("ElevationCancelled".into());
+        }
+        Err(_) => {
+            set_runtime_connection(&state, ConnectionState::Idle)?;
+            return Err("SystemVpnStartFailed".into());
+        }
+    };
+    if system_vpn_connectivity_test().is_err() {
+        let _ = controller.stop();
+        set_runtime_connection(&state, ConnectionState::Idle)?;
+        return Err("SystemVpnTrafficCheckFailed".into());
+    }
+    *state
+        .system_vpn
+        .lock()
+        .map_err(|_| "SystemVpnStateUnavailable")? = Some(controller);
+    set_runtime_connection(&state, ConnectionState::SystemVpnConnected)
+}
+
+#[tauri::command]
+fn disconnect_system_vpn(state: State<'_, AppState>) -> Result<(), String> {
+    let session = state
+        .system_vpn
+        .lock()
+        .map_err(|_| "SystemVpnStateUnavailable")?
+        .take();
+    if let Some(mut session) = session {
+        session.stop().map_err(|_| "SystemVpnStopFailed")?;
+    }
+    set_runtime_connection(&state, ConnectionState::Idle)
+}
 #[tauri::command]
 fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
+    if state
+        .system_vpn
+        .lock()
+        .map_err(|_| "SystemVpnStateUnavailable")?
+        .is_some()
+    {
+        return disconnect_system_vpn(state);
+    }
     let connection = state.core.disconnect()?;
     let mut runtime = state
         .runtime
         .lock()
         .map_err(|_| "Внутренняя ошибка состояния")?;
     runtime.connection = connection;
+    Ok(())
+}
+
+fn set_runtime_connection(
+    state: &State<'_, AppState>,
+    connection: ConnectionState,
+) -> Result<(), String> {
+    state
+        .runtime
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния")?
+        .connection = connection;
+    Ok(())
+}
+
+fn system_vpn_connectivity_test() -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .map_err(|_| "SystemVpnTrafficClientFailed")?;
+    for endpoint in [
+        "https://1.1.1.1/help",
+        "https://www.cloudflare.com/cdn-cgi/trace",
+    ] {
+        let response = client
+            .get(endpoint)
+            .send()
+            .map_err(|_| "SystemVpnTrafficRequestFailed")?;
+        if !response.status().is_success() {
+            return Err("SystemVpnTrafficStatusFailed".into());
+        }
+    }
     Ok(())
 }
 #[derive(serde::Serialize)]
@@ -237,6 +358,7 @@ pub fn run() {
                 runtime: Mutex::new(RuntimeState::default()),
                 core: XrayCoreManager::load(data),
                 secrets: Box::new(WindowsSecretStore::new()),
+                system_vpn: Mutex::new(None),
             });
             Ok(())
         })
@@ -252,7 +374,9 @@ pub fn run() {
             import_uri,
             select_server,
             connect,
-            disconnect
+            connect_system_vpn,
+            disconnect,
+            disconnect_system_vpn
         ])
         .run(tauri::generate_context!())
         .expect("error while running VOID Desktop");

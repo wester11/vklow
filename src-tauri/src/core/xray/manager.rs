@@ -1,7 +1,7 @@
 use crate::{
     core::xray::{
         archive::extract_verified_zip,
-        config::{tun_capability_config, vless_reality_outbound, VlessRealityOutbound},
+        config::{tun_capability_config, vless_reality_outbound},
         integrity::{parse_dgst_for_asset, verify_sha256},
         paths::XrayPaths,
         redaction::redact,
@@ -12,7 +12,11 @@ use crate::{
         state::InstalledState,
         version::XrayVersion,
     },
-    domain::{ConnectionState, Protocol, Server},
+    core::{
+        private_runtime::create_owner_only_directory,
+        system_vpn::{outbound_from_server, SystemVpnSessionSpec, PINNED_EXPERIMENTAL_TUN_VERSION},
+    },
+    domain::{ConnectionState, Server},
 };
 use serde::Serialize;
 use std::{
@@ -431,6 +435,45 @@ impl XrayCoreManager {
     pub fn experimental_tun_binary(&self) -> Result<PathBuf, String> {
         self.binary_for(XrayReleaseChannel::ExperimentalTun)
     }
+    pub fn pinned_experimental_tun_binary(&self) -> Result<PathBuf, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "Внутренняя ошибка Xray state")?;
+        if state.experimental_tun_version.as_deref() != Some(PINNED_EXPERIMENTAL_TUN_VERSION) {
+            return Err("PinnedExperimentalTunUnavailable".into());
+        }
+        drop(state);
+        self.experimental_tun_binary()
+    }
+    /// Runs the exact fixed System VPN configuration through the verified
+    /// experimental Xray binary before requesting elevation. The temporary file
+    /// lives below the app-private runtime directory, is session-bound and is
+    /// removed on every outcome.
+    pub fn preflight_system_vpn(&self, spec: &SystemVpnSessionSpec) -> Result<(), String> {
+        spec.validate()?;
+        let binary = self.pinned_experimental_tun_binary()?;
+        if !binary.with_file_name("wintun.dll").is_file() {
+            return Err("OfficialWintunUnavailable".into());
+        }
+        let directory = self.paths.runtime().join("system-vpn-preflight");
+        fs::create_dir_all(&directory).map_err(|_| "UnableToPrepareSystemVpnPreflight")?;
+        let directory = directory.join(&spec.session_id);
+        create_owner_only_directory(&directory)?;
+        let config = directory.join("config.json");
+        let temporary = config.with_extension("tmp");
+        let result = (|| {
+            let bytes = serde_json::to_vec(&spec.config()?)
+                .map_err(|_| "UnableToSerializeSystemVpnConfig")?;
+            fs::write(&temporary, bytes).map_err(|_| "UnableToWriteSystemVpnPreflight")?;
+            fs::rename(&temporary, &config).map_err(|_| "UnableToActivateSystemVpnPreflight")?;
+            Self::validate(&binary, &config, &spec.sensitive_values())
+        })();
+        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_file(&config);
+        let _ = fs::remove_dir(&directory);
+        result
+    }
     fn binary_for(&self, channel: XrayReleaseChannel) -> Result<PathBuf, String> {
         let state = self
             .state
@@ -456,22 +499,7 @@ impl XrayCoreManager {
         )
     }
     pub fn outbound_for(s: &Server) -> Result<serde_json::Value, String> {
-        if !matches!(s.summary.protocol, Protocol::Vless)
-            || s.security.as_deref() != Some("reality")
-        {
-            return Err("В этом этапе runtime поддерживает только VLESS Reality TCP".into());
-        }
-        let option = |key| s.options.get(key).cloned().unwrap_or_default();
-        vless_reality_outbound(&VlessRealityOutbound {
-            address: s.summary.address.clone(),
-            port: s.summary.port,
-            uuid: s.credential.clone(),
-            flow: s.options.get("flow").cloned(),
-            server_name: s.sni.clone().unwrap_or_else(|| option("sni")),
-            fingerprint: option("fp"),
-            public_key: option("pbk"),
-            short_id: option("sid"),
-        })
+        vless_reality_outbound(&outbound_from_server(s)?)
     }
     fn validate(binary: &Path, config: &Path, secrets: &[String]) -> Result<(), String> {
         let mut child = Command::new(binary)

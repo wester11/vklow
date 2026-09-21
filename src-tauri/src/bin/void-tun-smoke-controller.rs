@@ -200,6 +200,7 @@ fn run() -> Result<String, ElevationError> {
         } else {
             TunOperation::StartScopedTunSession
         },
+        system_vpn: None,
     };
     pipe.write_frame(&serde_json::to_vec(&request).map_err(|_| ElevationError::LaunchFailed)?)
         .map_err(|_| ElevationError::LaunchFailed)?;
@@ -292,6 +293,7 @@ fn run() -> Result<String, ElevationError> {
             controller_pid,
             helper_pid,
             operation: TunOperation::TestCrashOwnedCore,
+            system_vpn: None,
         };
         pipe.write_frame(&serde_json::to_vec(&crash).map_err(|_| ElevationError::LaunchFailed)?)
             .map_err(|_| ElevationError::LaunchFailed)?;
@@ -448,6 +450,7 @@ fn stop_session(
         controller_pid,
         helper_pid,
         operation: TunOperation::StopTunSession,
+        system_vpn: None,
     };
     pipe.write_frame(&serde_json::to_vec(&stop).map_err(|_| ElevationError::LaunchFailed)?)
         .map_err(|_| ElevationError::LaunchFailed)?;

@@ -1,7 +1,10 @@
 pub mod diagnostics;
 pub mod job;
 pub mod network;
+pub mod private_runtime;
 pub mod secrets;
+pub mod system_vpn;
+pub mod system_vpn_controller;
 pub mod tun;
 pub mod tun_launcher;
 pub mod tun_pipe;
