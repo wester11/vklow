@@ -26,6 +26,7 @@ pub enum SystemVpnRejectionReason {
     UnsupportedSecurity,
     PublicVlessRequiresTransportSecurityOrEncryption,
     PrivateVlessRequiresExplicitTrustedPolicy,
+    UnroutableVlessEndpoint,
     UnsupportedFlow,
     MissingRealityPublicKey,
     MissingServerName,
@@ -47,6 +48,7 @@ impl SystemVpnRejectionReason {
             Self::PrivateVlessRequiresExplicitTrustedPolicy => {
                 "PrivateVlessRequiresExplicitTrustedPolicy"
             }
+            Self::UnroutableVlessEndpoint => "UnroutableVlessEndpoint",
             Self::UnsupportedFlow => "UnsupportedFlow",
             Self::MissingRealityPublicKey => "MissingRealityPublicKey",
             Self::MissingServerName => "MissingServerName",
@@ -292,7 +294,8 @@ pub fn compatibility_for(server: &Server) -> SystemVpnCompatibility {
             "public" | "domain" => {
                 SystemVpnRejectionReason::PublicVlessRequiresTransportSecurityOrEncryption
             }
-            _ => SystemVpnRejectionReason::PrivateVlessRequiresExplicitTrustedPolicy,
+            "private" => SystemVpnRejectionReason::PrivateVlessRequiresExplicitTrustedPolicy,
+            _ => SystemVpnRejectionReason::UnroutableVlessEndpoint,
         });
     }
     if security != "reality" {
@@ -589,6 +592,19 @@ mod tests {
                 .err()
                 .unwrap(),
             "PublicVlessRequiresTransportSecurityOrEncryption"
+        );
+    }
+
+    #[test]
+    fn unspecified_vless_endpoint_is_rejected_before_uac_or_config_generation() {
+        let mut server = fixture();
+        server.summary.address = "0.0.0.0".into();
+        server.security = Some("none".into());
+        let diagnostic = compatibility_diagnostic(&server);
+        assert_eq!(diagnostic.address_class, "unspecified");
+        assert_eq!(
+            diagnostic.rejection_reason,
+            Some(SystemVpnRejectionReason::UnroutableVlessEndpoint)
         );
     }
 
