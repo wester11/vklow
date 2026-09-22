@@ -1,3 +1,4 @@
+use crate::domain::VlessEncryptionConfig;
 use serde::Serialize;
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -10,7 +11,7 @@ pub struct TunInboundSettings {
     pub auto_system_routing_table: Vec<String>,
     pub auto_outbounds_interface: String,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct TunInbound {
     port: u16,
     protocol: &'static str,
@@ -21,7 +22,7 @@ struct TunValidationConfig {
     inbounds: Vec<TunInbound>,
     outbounds: Vec<serde_json::Value>,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VlessRealityOutbound {
     pub address: String,
@@ -33,11 +34,36 @@ pub struct VlessRealityOutbound {
     pub public_key: String,
     pub short_id: String,
 }
+
+#[derive(Clone)]
+pub struct VlessEncryptedTcpOutbound {
+    pub address: String,
+    pub port: u16,
+    pub uuid: String,
+    pub flow: Option<String>,
+    pub encryption: VlessEncryptionConfig,
+}
+
+#[derive(Clone)]
+pub enum CommonVlessOutbound {
+    RealityTcp(VlessRealityOutbound),
+    EncryptedTcp(VlessEncryptedTcpOutbound),
+}
 pub fn vless_reality_tcp(
     input: &VlessRealityOutbound,
     socks_port: u16,
 ) -> Result<serde_json::Value, String> {
     let outbound = vless_reality_outbound(input)?;
+    Ok(
+        serde_json::json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":socks_port,"protocol":"socks","settings":{"udp":true}}],"outbounds":[outbound]}),
+    )
+}
+
+pub fn vless_encrypted_tcp(
+    input: &VlessEncryptedTcpOutbound,
+    socks_port: u16,
+) -> Result<serde_json::Value, String> {
+    let outbound = common_vless_outbound(&CommonVlessOutbound::EncryptedTcp(input.clone()))?;
     Ok(
         serde_json::json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":socks_port,"protocol":"socks","settings":{"udp":true}}],"outbounds":[outbound]}),
     )
@@ -60,6 +86,30 @@ pub fn vless_reality_outbound(input: &VlessRealityOutbound) -> Result<serde_json
     Ok(
         serde_json::json!({"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":input.address,"port":input.port,"users":[{"id":input.uuid,"encryption":"none","flow":input.flow}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":input.server_name,"fingerprint":input.fingerprint,"password":input.public_key,"shortId":input.short_id}}}),
     )
+}
+
+/// The only common credential-bearing VLESS outbound surface. Both SOCKS and
+/// System VPN call this builder; neither can inject arbitrary Xray JSON.
+pub fn common_vless_outbound(input: &CommonVlessOutbound) -> Result<serde_json::Value, String> {
+    match input {
+        CommonVlessOutbound::RealityTcp(value) => vless_reality_outbound(value),
+        CommonVlessOutbound::EncryptedTcp(value) => {
+            if value.address.is_empty() || value.port == 0 || value.uuid.is_empty() {
+                return Err("VlessEncryption-конфигурация неполная".into());
+            }
+            if let Some(flow) = &value.flow {
+                if !matches!(
+                    flow.as_str(),
+                    "" | "xtls-rprx-vision" | "xtls-rprx-vision-udp443"
+                ) {
+                    return Err("VLESS flow не поддерживается".into());
+                }
+            }
+            Ok(
+                serde_json::json!({"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":value.address,"port":value.port,"users":[{"id":value.uuid,"encryption":value.encryption.as_config_value(),"flow":value.flow}]}]},"streamSettings":{"network":"tcp","security":"none"}}),
+            )
+        }
+    }
 }
 pub fn loopback_freedom_socks(socks_port: u16) -> serde_json::Value {
     serde_json::json!({
@@ -157,7 +207,7 @@ pub fn full_ipv4_freedom_config(adapter_name: &str) -> Result<serde_json::Value,
 
 pub fn full_ipv4_tun_config(
     adapter_name: &str,
-    outbound: &VlessRealityOutbound,
+    outbound: &CommonVlessOutbound,
 ) -> Result<serde_json::Value, String> {
     if adapter_name.len() > 96
         || adapter_name.is_empty()
@@ -187,7 +237,7 @@ pub fn full_ipv4_tun_config(
                 auto_outbounds_interface: "auto".into(),
             },
         }],
-        outbounds: vec![vless_reality_outbound(outbound)?],
+        outbounds: vec![common_vless_outbound(outbound)?],
     })
     .map_err(|_| "Не удалось сериализовать System VPN TUN config".into())
 }
@@ -265,11 +315,39 @@ mod tests {
             short_id: "aabb".into(),
         };
         let proxy = vless_reality_tcp(&server, 32145).unwrap();
-        let tun = full_ipv4_tun_config("VOID Tunnel fixture", &server).unwrap();
+        let tun = full_ipv4_tun_config(
+            "VOID Tunnel fixture",
+            &CommonVlessOutbound::RealityTcp(server.clone()),
+        )
+        .unwrap();
         assert_eq!(
             proxy["outbounds"][0],
             vless_reality_outbound(&server).unwrap()
         );
+        assert_eq!(tun["outbounds"][0], proxy["outbounds"][0]);
+    }
+
+    #[test]
+    fn encrypted_vless_uses_protocol_encryption_not_transport_security() {
+        let encryption = crate::domain::VlessEncryption::from_sharing_link(Some("mlkem768x25519plus.native.1rtt.100-111-1111.75-0-111.50-0-3333.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()));
+        let outbound = VlessEncryptedTcpOutbound {
+            address: "198.51.100.7".into(),
+            port: 443,
+            uuid: "11111111-1111-1111-1111-111111111111".into(),
+            flow: None,
+            encryption: encryption.enabled_config().unwrap().clone(),
+        };
+        let proxy = vless_encrypted_tcp(&outbound, 32145).unwrap();
+        let tun = full_ipv4_tun_config(
+            "VOID Tunnel fixture",
+            &CommonVlessOutbound::EncryptedTcp(outbound),
+        )
+        .unwrap();
+        assert_eq!(
+            proxy["outbounds"][0]["settings"]["vnext"][0]["users"][0]["encryption"],
+            serde_json::json!("mlkem768x25519plus.native.1rtt.100-111-1111.75-0-111.50-0-3333.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        );
+        assert_eq!(proxy["outbounds"][0]["streamSettings"]["security"], "none");
         assert_eq!(tun["outbounds"][0], proxy["outbounds"][0]);
     }
 }

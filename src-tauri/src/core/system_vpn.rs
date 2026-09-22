@@ -3,8 +3,10 @@
 //! arbitrary JSON configuration.
 
 use crate::{
-    core::xray::config::{full_ipv4_tun_config, VlessRealityOutbound},
-    domain::{Protocol, Server},
+    core::xray::config::{
+        full_ipv4_tun_config, CommonVlessOutbound, VlessEncryptedTcpOutbound, VlessRealityOutbound,
+    },
+    domain::{Protocol, Server, VlessEncryptionConfig},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,7 +24,8 @@ pub enum SystemVpnRejectionReason {
     UnsupportedProtocol,
     UnsupportedTransport,
     UnsupportedSecurity,
-    PlainVlessRequiresTransportSecurity,
+    PublicVlessRequiresTransportSecurityOrEncryption,
+    PrivateVlessRequiresExplicitTrustedPolicy,
     UnsupportedFlow,
     MissingRealityPublicKey,
     MissingServerName,
@@ -38,7 +41,12 @@ impl SystemVpnRejectionReason {
             Self::UnsupportedProtocol => "UnsupportedProtocol",
             Self::UnsupportedTransport => "UnsupportedTransport",
             Self::UnsupportedSecurity => "UnsupportedSecurity",
-            Self::PlainVlessRequiresTransportSecurity => "PlainVlessRequiresTransportSecurity",
+            Self::PublicVlessRequiresTransportSecurityOrEncryption => {
+                "PublicVlessRequiresTransportSecurityOrEncryption"
+            }
+            Self::PrivateVlessRequiresExplicitTrustedPolicy => {
+                "PrivateVlessRequiresExplicitTrustedPolicy"
+            }
             Self::UnsupportedFlow => "UnsupportedFlow",
             Self::MissingRealityPublicKey => "MissingRealityPublicKey",
             Self::MissingServerName => "MissingServerName",
@@ -63,6 +71,9 @@ pub struct SafeSystemVpnCompatibilityDiagnostic {
     pub protocol: &'static str,
     pub transport: &'static str,
     pub security_type: &'static str,
+    pub vless_encryption_field_present: bool,
+    pub vless_encryption_status: &'static str,
+    pub vless_encryption_metadata: Option<&'static str>,
     pub flow_type: &'static str,
     pub sni_present: bool,
     pub reality_public_key_present: bool,
@@ -70,6 +81,7 @@ pub struct SafeSystemVpnCompatibilityDiagnostic {
     pub fingerprint_present: bool,
     pub spider_x_present: bool,
     pub address_kind: &'static str,
+    pub address_class: &'static str,
     pub compatibility: &'static str,
     pub rejection_reason: Option<SystemVpnRejectionReason>,
 }
@@ -94,9 +106,20 @@ pub struct VlessRealityTcpSpec {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct VlessEncryptedTcpSpec {
+    pub address: String,
+    pub port: u16,
+    pub uuid: String,
+    pub flow: Option<String>,
+    pub encryption: VlessEncryptionConfig,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "protocol", content = "settings", rename_all = "snake_case")]
 pub enum SystemVpnOutbound {
     VlessRealityTcp(VlessRealityTcpSpec),
+    VlessEncryptedTcp(VlessEncryptedTcpSpec),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -117,16 +140,29 @@ impl SystemVpnSessionSpec {
             session_id: Uuid::new_v4().to_string(),
             selected_server_id: server.summary.id.clone(),
             mode: SystemVpnMode::SystemIpv4Experimental,
-            outbound: SystemVpnOutbound::VlessRealityTcp(VlessRealityTcpSpec {
-                address: outbound.address,
-                port: outbound.port,
-                uuid: outbound.uuid,
-                flow: outbound.flow,
-                server_name: outbound.server_name,
-                fingerprint: outbound.fingerprint,
-                public_key: outbound.public_key,
-                short_id: outbound.short_id,
-            }),
+            outbound: match outbound {
+                CommonVlessOutbound::RealityTcp(outbound) => {
+                    SystemVpnOutbound::VlessRealityTcp(VlessRealityTcpSpec {
+                        address: outbound.address,
+                        port: outbound.port,
+                        uuid: outbound.uuid,
+                        flow: outbound.flow,
+                        server_name: outbound.server_name,
+                        fingerprint: outbound.fingerprint,
+                        public_key: outbound.public_key,
+                        short_id: outbound.short_id,
+                    })
+                }
+                CommonVlessOutbound::EncryptedTcp(outbound) => {
+                    SystemVpnOutbound::VlessEncryptedTcp(VlessEncryptedTcpSpec {
+                        address: outbound.address,
+                        port: outbound.port,
+                        uuid: outbound.uuid,
+                        flow: outbound.flow,
+                        encryption: outbound.encryption,
+                    })
+                }
+            },
         };
         spec.validate()?;
         Ok(spec)
@@ -164,6 +200,16 @@ impl SystemVpnSessionSpec {
                 }
                 values
             }
+            SystemVpnOutbound::VlessEncryptedTcp(value) => {
+                let mut values = vec![
+                    value.uuid.clone(),
+                    value.encryption.as_config_value().into(),
+                ];
+                if let Some(flow) = &value.flow {
+                    values.push(flow.clone());
+                }
+                values
+            }
         }
     }
 
@@ -182,7 +228,7 @@ impl SystemVpnSessionSpec {
         Ok(())
     }
 
-    fn outbound_config(&self) -> Result<VlessRealityOutbound, String> {
+    fn outbound_config(&self) -> Result<CommonVlessOutbound, String> {
         match &self.outbound {
             SystemVpnOutbound::VlessRealityTcp(value) => {
                 validate_text(&value.address, 253, "InvalidSystemVpnAddress")?;
@@ -196,7 +242,7 @@ impl SystemVpnSessionSpec {
                 if let Some(flow) = &value.flow {
                     validate_text(flow, 64, "InvalidSystemVpnFlow")?;
                 }
-                Ok(VlessRealityOutbound {
+                Ok(CommonVlessOutbound::RealityTcp(VlessRealityOutbound {
                     address: value.address.clone(),
                     port: value.port,
                     uuid: value.uuid.clone(),
@@ -205,7 +251,26 @@ impl SystemVpnSessionSpec {
                     fingerprint: value.fingerprint.clone(),
                     public_key: value.public_key.clone(),
                     short_id: value.short_id.clone(),
-                })
+                }))
+            }
+            SystemVpnOutbound::VlessEncryptedTcp(value) => {
+                validate_text(&value.address, 253, "InvalidSystemVpnAddress")?;
+                if value.port == 0 {
+                    return Err("InvalidSystemVpnPort".into());
+                }
+                Uuid::parse_str(&value.uuid).map_err(|_| "InvalidSystemVpnUserId")?;
+                if let Some(flow) = &value.flow {
+                    validate_text(flow, 64, "InvalidSystemVpnFlow")?;
+                }
+                Ok(CommonVlessOutbound::EncryptedTcp(
+                    VlessEncryptedTcpOutbound {
+                        address: value.address.clone(),
+                        port: value.port,
+                        uuid: value.uuid.clone(),
+                        flow: value.flow.clone(),
+                        encryption: value.encryption.clone(),
+                    },
+                ))
             }
         }
     }
@@ -220,18 +285,21 @@ pub fn compatibility_for(server: &Server) -> SystemVpnCompatibility {
     }
     let security = normalized_type(server.security.as_deref());
     if security == "none" {
-        return SystemVpnCompatibility::Rejected(
-            SystemVpnRejectionReason::PlainVlessRequiresTransportSecurity,
-        );
+        if server.vless_encryption.enabled_config().is_some() {
+            return supported_vless_flow(server);
+        }
+        return SystemVpnCompatibility::Rejected(match address_class(&server.summary.address) {
+            "public" | "domain" => {
+                SystemVpnRejectionReason::PublicVlessRequiresTransportSecurityOrEncryption
+            }
+            _ => SystemVpnRejectionReason::PrivateVlessRequiresExplicitTrustedPolicy,
+        });
     }
     if security != "reality" {
         return SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::UnsupportedSecurity);
     }
-    if !matches!(
-        flow_type(server.options.get("flow").map(String::as_str)),
-        "empty" | "xtls-rprx-vision" | "xtls-rprx-vision-udp443"
-    ) {
-        return SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::UnsupportedFlow);
+    if let SystemVpnCompatibility::Rejected(reason) = supported_vless_flow(server) {
+        return SystemVpnCompatibility::Rejected(reason);
     }
     if !has_nonempty(server.sni.as_deref())
         .or_else(|| has_nonempty(server.options.get("sni").map(String::as_str)))
@@ -253,6 +321,17 @@ pub fn compatibility_for(server: &Server) -> SystemVpnCompatibility {
     SystemVpnCompatibility::Eligible
 }
 
+fn supported_vless_flow(server: &Server) -> SystemVpnCompatibility {
+    if matches!(
+        flow_type(server.options.get("flow").map(String::as_str)),
+        "empty" | "xtls-rprx-vision" | "xtls-rprx-vision-udp443"
+    ) {
+        SystemVpnCompatibility::Eligible
+    } else {
+        SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::UnsupportedFlow)
+    }
+}
+
 pub fn compatibility_diagnostic(server: &Server) -> SafeSystemVpnCompatibilityDiagnostic {
     let compatibility = compatibility_for(server);
     let rejection_reason = match compatibility {
@@ -263,6 +342,12 @@ pub fn compatibility_diagnostic(server: &Server) -> SafeSystemVpnCompatibilityDi
         protocol: protocol_type(server.summary.protocol),
         transport: normalized_type(server.summary.transport.as_deref()),
         security_type: normalized_type(server.security.as_deref()),
+        vless_encryption_field_present: server.vless_encryption.field_present(),
+        vless_encryption_status: server.vless_encryption.safe_status(),
+        vless_encryption_metadata: server
+            .vless_encryption
+            .enabled_config()
+            .map(VlessEncryptionConfig::safe_metadata),
         flow_type: flow_type(server.options.get("flow").map(String::as_str)),
         sni_present: has_nonempty(server.sni.as_deref())
             .or_else(|| has_nonempty(server.options.get("sni").map(String::as_str)))
@@ -280,6 +365,7 @@ pub fn compatibility_diagnostic(server: &Server) -> SafeSystemVpnCompatibilityDi
         } else {
             "domain"
         },
+        address_class: address_class(&server.summary.address),
         compatibility: if rejection_reason.is_some() {
             "rejected"
         } else {
@@ -289,12 +375,29 @@ pub fn compatibility_diagnostic(server: &Server) -> SafeSystemVpnCompatibilityDi
     }
 }
 
-pub fn outbound_from_server(server: &Server) -> Result<VlessRealityOutbound, String> {
+pub fn outbound_from_server(server: &Server) -> Result<CommonVlessOutbound, String> {
     if let SystemVpnCompatibility::Rejected(reason) = compatibility_for(server) {
         return Err(reason.code().into());
     }
+    let security = normalized_type(server.security.as_deref());
+    if security == "none" {
+        return server
+            .vless_encryption
+            .enabled_config()
+            .cloned()
+            .map(|encryption| {
+                CommonVlessOutbound::EncryptedTcp(VlessEncryptedTcpOutbound {
+                    address: server.summary.address.clone(),
+                    port: server.summary.port,
+                    uuid: server.credential.clone(),
+                    flow: server.options.get("flow").cloned(),
+                    encryption,
+                })
+            })
+            .ok_or_else(|| "MissingVlessEncryptionMaterial".into());
+    }
     let option = |key| server.options.get(key).cloned().unwrap_or_default();
-    Ok(VlessRealityOutbound {
+    Ok(CommonVlessOutbound::RealityTcp(VlessRealityOutbound {
         address: server.summary.address.clone(),
         port: server.summary.port,
         uuid: server.credential.clone(),
@@ -303,7 +406,27 @@ pub fn outbound_from_server(server: &Server) -> Result<VlessRealityOutbound, Str
         fingerprint: option("fp"),
         public_key: option("pbk"),
         short_id: option("sid"),
-    })
+    }))
+}
+
+fn address_class(address: &str) -> &'static str {
+    let Ok(address) = address.parse::<IpAddr>() else {
+        return "domain";
+    };
+    match address {
+        IpAddr::V4(address) if address.is_loopback() => "loopback",
+        IpAddr::V4(address) if address.is_private() => "private",
+        IpAddr::V4(address) if address.is_link_local() => "link_local",
+        IpAddr::V4(address) if address.is_unspecified() => "unspecified",
+        IpAddr::V4(address) if address.is_multicast() || address.is_broadcast() => "multicast",
+        IpAddr::V4(_) => "public",
+        IpAddr::V6(address) if address.is_loopback() => "loopback",
+        IpAddr::V6(address) if address.is_unique_local() => "private",
+        IpAddr::V6(address) if address.is_unicast_link_local() => "link_local",
+        IpAddr::V6(address) if address.is_unspecified() => "unspecified",
+        IpAddr::V6(address) if address.is_multicast() => "multicast",
+        IpAddr::V6(_) => "public",
+    }
 }
 
 fn protocol_type(protocol: Protocol) -> &'static str {
@@ -357,7 +480,7 @@ fn validate_text(value: &str, limit: usize, error: &'static str) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ServerHealth, ServerSummary};
+    use crate::domain::{ServerHealth, ServerSummary, VlessEncryption};
     use std::collections::HashMap;
 
     fn fixture() -> Server {
@@ -376,6 +499,7 @@ mod tests {
             credential: "22222222-2222-2222-2222-222222222222".into(),
             security: Some("reality".into()),
             sni: Some("www.example.com".into()),
+            vless_encryption: VlessEncryption::Absent,
             options: HashMap::from([
                 ("fp".into(), "chrome".into()),
                 ("pbk".into(), "public-key".into()),
@@ -409,7 +533,9 @@ mod tests {
         spec.selected_server_id = "not-a-uuid".into();
         assert_eq!(spec.validate().unwrap_err(), "InvalidSelectedServerId");
         spec.selected_server_id = fixture().summary.id;
-        let SystemVpnOutbound::VlessRealityTcp(outbound) = &mut spec.outbound;
+        let SystemVpnOutbound::VlessRealityTcp(outbound) = &mut spec.outbound else {
+            panic!("fixture must remain a Reality outbound");
+        };
         outbound.port = 0;
         assert_eq!(spec.validate().unwrap_err(), "InvalidSystemVpnPort");
     }
@@ -457,11 +583,51 @@ mod tests {
     fn plain_vless_is_rejected_before_uac_or_config_generation() {
         let mut server = fixture();
         server.security = Some("none".into());
+        server.summary.address = "198.51.100.7".into();
         assert_eq!(
             SystemVpnSessionSpec::from_selected_server(&server)
                 .err()
                 .unwrap(),
-            "PlainVlessRequiresTransportSecurity"
+            "PublicVlessRequiresTransportSecurityOrEncryption"
         );
+    }
+
+    #[test]
+    fn public_vless_with_typed_protocol_encryption_builds_a_system_vpn_config() {
+        let mut server = fixture();
+        server.summary.address = "198.51.100.7".into();
+        server.security = Some("none".into());
+        server.vless_encryption = VlessEncryption::from_sharing_link(Some("mlkem768x25519plus.native.1rtt.100-111-1111.75-0-111.50-0-3333.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()));
+        let diagnostic = compatibility_diagnostic(&server);
+        assert_eq!(diagnostic.address_class, "public");
+        assert_eq!(diagnostic.vless_encryption_status, "enabled");
+        let config = SystemVpnSessionSpec::from_selected_server(&server)
+            .unwrap()
+            .config()
+            .unwrap();
+        assert_eq!(
+            config["outbounds"][0]["settings"]["vnext"][0]["users"][0]["encryption"],
+            serde_json::json!("mlkem768x25519plus.native.1rtt.100-111-1111.75-0-111.50-0-3333.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        );
+        assert_eq!(config["outbounds"][0]["streamSettings"]["security"], "none");
+    }
+
+    #[test]
+    fn synthetic_vless_encryption_config_validates_with_the_pinned_core_when_enabled() {
+        if std::env::var_os("VOID_XRAY_VLESS_ENCRYPTION_VALIDATION").is_none() {
+            return;
+        }
+        let app_data = std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .expect("APPDATA must be available")
+            .join("com.void.desktop");
+        let mut server = fixture();
+        server.summary.address = "198.51.100.7".into();
+        server.security = Some("none".into());
+        server.vless_encryption = VlessEncryption::from_sharing_link(Some("mlkem768x25519plus.native.1rtt.100-111-1111.75-0-111.50-0-3333.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()));
+        let spec = SystemVpnSessionSpec::from_selected_server(&server).unwrap();
+        crate::core::xray::manager::XrayCoreManager::load(app_data)
+            .preflight_system_vpn(&spec)
+            .expect("pinned Xray must accept the synthetic VLESS Encryption config");
     }
 }

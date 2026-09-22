@@ -1,4 +1,4 @@
-use crate::domain::{Protocol, Server, ServerHealth, ServerSummary};
+use crate::domain::{Protocol, Server, ServerHealth, ServerSummary, VlessEncryption};
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
@@ -31,6 +31,7 @@ struct ServerInput {
     credential: String,
     security: Option<String>,
     sni: Option<String>,
+    vless_encryption: VlessEncryption,
     options: HashMap<String, String>,
 }
 fn base_server(input: ServerInput) -> Server {
@@ -53,6 +54,7 @@ fn base_server(input: ServerInput) -> Server {
         credential: input.credential,
         security: input.security,
         sni: input.sni,
+        vless_encryption: input.vless_encryption,
         options: input.options,
     }
 }
@@ -67,7 +69,10 @@ fn parse_standard(input: &str, protocol: Protocol) -> Result<Server, String> {
     if matches!(protocol, Protocol::Vless) && Uuid::parse_str(credential).is_err() {
         return Err("VLESS URI содержит некорректный UUID".into());
     }
-    let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    let mut query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    let vless_encryption = matches!(protocol, Protocol::Vless)
+        .then(|| VlessEncryption::from_sharing_link(query.remove("encryption")))
+        .unwrap_or(VlessEncryption::Absent);
     let name = percent_decode_str(url.fragment().unwrap_or_default())
         .decode_utf8_lossy()
         .into_owned();
@@ -80,6 +85,7 @@ fn parse_standard(input: &str, protocol: Protocol) -> Result<Server, String> {
         credential: credential.to_owned(),
         security: query.get("security").cloned(),
         sni: query.get("sni").cloned(),
+        vless_encryption,
         options: query,
     }))
 }
@@ -113,6 +119,7 @@ fn parse_shadowsocks(input: &str) -> Result<Server, String> {
         credential: format!("{}:{}", url.username(), password),
         security: None,
         sni: None,
+        vless_encryption: VlessEncryption::Absent,
         options: HashMap::new(),
     }))
 }
@@ -163,6 +170,7 @@ fn parse_vmess(input: &str) -> Result<Server, String> {
         credential: item.id,
         security: (!item.tls.is_empty()).then_some(item.tls),
         sni: (!item.sni.is_empty()).then_some(item.sni),
+        vless_encryption: VlessEncryption::Absent,
         options: HashMap::new(),
     }))
 }
@@ -202,6 +210,23 @@ mod tests {
             Some("/fake-spider")
         );
     }
+
+    #[test]
+    fn parses_typed_vless_encryption_without_retaining_it_in_generic_options() {
+        let encryption = "mlkem768x25519plus.native.1rtt.100-111-1111.75-0-111.50-0-3333.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let item = parse_uri(&format!("vless://11111111-1111-1111-1111-111111111111@198.51.100.7:443?type=tcp&security=none&encryption={encryption}#Synthetic")).unwrap();
+        assert!(item.vless_encryption.field_present());
+        assert_eq!(item.vless_encryption.safe_status(), "enabled");
+        assert_eq!(
+            item.vless_encryption
+                .enabled_config()
+                .unwrap()
+                .safe_metadata(),
+            "mlkem768x25519plus/native/1rtt"
+        );
+        assert!(!item.options.contains_key("encryption"));
+    }
+
     #[test]
     fn rejects_unknown_scheme() {
         assert!(parse_uri("file:///etc/passwd").is_err());

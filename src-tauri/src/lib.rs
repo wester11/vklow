@@ -116,7 +116,9 @@ fn export_diagnostics(state: State<'_, AppState>) -> Result<String, String> {
         .servers
         .iter()
         .flat_map(|server| {
-            std::iter::once(server.credential.clone()).chain(server.options.values().cloned())
+            std::iter::once(server.credential.clone())
+                .chain(server.options.values().cloned())
+                .chain(server.vless_encryption.sensitive_value().map(str::to_owned))
         })
         .collect::<Vec<_>>();
     let file = export_diagnostics_file(&snapshot, &path, &secrets)?;

@@ -1,7 +1,7 @@
 use crate::{
     core::xray::{
         archive::extract_verified_zip,
-        config::{tun_capability_config, vless_reality_outbound},
+        config::{common_vless_outbound, tun_capability_config},
         integrity::{parse_dgst_for_asset, verify_sha256},
         paths::XrayPaths,
         redaction::redact,
@@ -499,7 +499,7 @@ impl XrayCoreManager {
         )
     }
     pub fn outbound_for(s: &Server) -> Result<serde_json::Value, String> {
-        vless_reality_outbound(&outbound_from_server(s)?)
+        common_vless_outbound(&outbound_from_server(s)?)
     }
     fn validate(binary: &Path, config: &Path, secrets: &[String]) -> Result<(), String> {
         let mut child = Command::new(binary)
@@ -532,9 +532,16 @@ impl XrayCoreManager {
         if output.status.success() {
             Ok(())
         } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = if stderr.trim().is_empty() {
+                stdout.as_ref()
+            } else {
+                stderr.as_ref()
+            };
             Err(format!(
                 "Xray отклонил runtime config: {}",
-                redact(&String::from_utf8_lossy(&output.stderr), secrets)
+                redact(detail, secrets)
                     .trim()
                     .chars()
                     .take(500)
@@ -704,6 +711,9 @@ impl XrayCoreManager {
     fn secrets(s: &Server) -> Vec<String> {
         let mut values = vec![s.credential.clone()];
         values.extend(s.options.values().cloned());
+        if let Some(encryption) = s.vless_encryption.sensitive_value() {
+            values.push(encryption.into());
+        }
         values
     }
     fn run_version(binary: &Path) -> Result<XrayVersion, String> {

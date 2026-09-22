@@ -133,8 +133,11 @@ fn safe_compatibility_line(server: &Server) -> String {
         .map(|reason| reason.code())
         .unwrap_or("None");
     format!(
-        "security_type={} flow_type={} sni_present={} reality_public_key_present={} short_id_present={} fingerprint_present={} spider_x_present={} address_kind={} compatibility={} rejection_reason={}",
+        "security_type={} vless_encryption_field_present={} vless_encryption_status={} vless_encryption_metadata={} flow_type={} sni_present={} reality_public_key_present={} short_id_present={} fingerprint_present={} spider_x_present={} address_kind={} address_class={} compatibility={} rejection_reason={}",
         diagnostic.security_type,
+        yes_no(diagnostic.vless_encryption_field_present),
+        diagnostic.vless_encryption_status,
+        diagnostic.vless_encryption_metadata.unwrap_or("none"),
         diagnostic.flow_type,
         yes_no(diagnostic.sni_present),
         yes_no(diagnostic.reality_public_key_present),
@@ -142,6 +145,7 @@ fn safe_compatibility_line(server: &Server) -> String {
         yes_no(diagnostic.fingerprint_present),
         yes_no(diagnostic.spider_x_present),
         diagnostic.address_kind,
+        diagnostic.address_class,
         diagnostic.compatibility,
         reason,
     )
@@ -160,6 +164,7 @@ fn scrub_servers(servers: &mut [Server]) {
         server.credential.zeroize();
         server.security.as_mut().map(Zeroize::zeroize);
         server.sni.as_mut().map(Zeroize::zeroize);
+        server.vless_encryption.zeroize();
         for value in server.options.values_mut() {
             value.zeroize();
         }
@@ -557,7 +562,7 @@ fn contains_secret(path: &Path, secret: &[u8]) -> Result<bool, ()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use void_desktop_lib::domain::{ServerHealth, ServerSummary};
+    use void_desktop_lib::domain::{ServerHealth, ServerSummary, VlessEncryption};
 
     #[test]
     fn safe_output_never_includes_server_address_or_credential() {
@@ -576,6 +581,7 @@ mod tests {
             credential: "private-credential".into(),
             security: Some("reality".into()),
             sni: None,
+            vless_encryption: VlessEncryption::Absent,
             options: HashMap::new(),
         };
         let output = safe_server_line(&server);
