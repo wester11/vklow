@@ -1,4 +1,6 @@
-use crate::domain::{Protocol, Server, ServerHealth, ServerSummary, VlessEncryption};
+use crate::domain::{
+    Protocol, Server, ServerEndpoint, ServerHealth, ServerSummary, VlessEncryption,
+};
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
@@ -6,8 +8,89 @@ use base64::{
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use url::Url;
 use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawHostKind {
+    Domain,
+    Ipv4,
+    Ipv6,
+    Empty,
+    Invalid,
+}
+
+impl RawHostKind {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Domain => "domain",
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+            Self::Empty => "empty",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// An address-free authority observation used only for the development
+/// provenance diagnostic. `canonical` must be fingerprinted immediately and
+/// never printed or persisted.
+#[derive(Clone, Debug)]
+pub struct RawAuthorityObservation {
+    pub present: bool,
+    pub kind: RawHostKind,
+    pub unspecified: bool,
+    pub canonical: Option<String>,
+}
+
+pub fn inspect_uri_authority(input: &str) -> RawAuthorityObservation {
+    let Ok(url) = Url::parse(input) else {
+        return RawAuthorityObservation {
+            present: false,
+            kind: RawHostKind::Invalid,
+            unspecified: false,
+            canonical: None,
+        };
+    };
+    let Some(host) = url.host_str() else {
+        return RawAuthorityObservation {
+            present: false,
+            kind: RawHostKind::Empty,
+            unspecified: false,
+            canonical: None,
+        };
+    };
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => RawAuthorityObservation {
+            present: true,
+            kind: RawHostKind::Ipv4,
+            unspecified: address.is_unspecified(),
+            canonical: Some(address.to_string()),
+        },
+        Ok(IpAddr::V6(address)) => RawAuthorityObservation {
+            present: true,
+            kind: RawHostKind::Ipv6,
+            unspecified: address.is_unspecified(),
+            canonical: Some(address.to_string()),
+        },
+        Err(_) => match ServerEndpoint::from_uri_host(Some(host)) {
+            Ok(ServerEndpoint::Domain(domain)) => RawAuthorityObservation {
+                present: true,
+                kind: RawHostKind::Domain,
+                unspecified: false,
+                canonical: Some(domain),
+            },
+            Ok(_) => unreachable!("IP endpoints are handled before domain parsing"),
+            Err(_) => RawAuthorityObservation {
+                present: true,
+                kind: RawHostKind::Invalid,
+                unspecified: false,
+                canonical: None,
+            },
+        },
+    }
+}
 pub fn parse_uri(input: &str) -> Result<Server, String> {
     let scheme = input
         .split(':')
@@ -25,7 +108,7 @@ pub fn parse_uri(input: &str) -> Result<Server, String> {
 struct ServerInput {
     protocol: Protocol,
     name: String,
-    address: String,
+    endpoint: ServerEndpoint,
     port: u16,
     transport: Option<String>,
     credential: String,
@@ -39,18 +122,19 @@ fn base_server(input: ServerInput) -> Server {
         summary: ServerSummary {
             id: Uuid::new_v4().to_string(),
             name: if input.name.trim().is_empty() {
-                format!("{}:{}", input.address, input.port)
+                "Unnamed server".into()
             } else {
                 input.name
             },
             protocol: input.protocol,
-            address: input.address,
+            endpoint_kind: input.endpoint.kind(),
             port: input.port,
             transport: input.transport,
             country: None,
             health: ServerHealth::Unknown,
             latency_ms: None,
         },
+        endpoint: input.endpoint,
         credential: input.credential,
         security: input.security,
         sni: input.sni,
@@ -59,8 +143,8 @@ fn base_server(input: ServerInput) -> Server {
     }
 }
 fn parse_standard(input: &str, protocol: Protocol) -> Result<Server, String> {
-    let url = Url::parse(input).map_err(|_| "Некорректный URI")?;
-    let address = url.host_str().ok_or("В URI отсутствует сервер")?.to_owned();
+    let url = Url::parse(input).map_err(|_| String::from(standard_authority_error(input)))?;
+    let endpoint = ServerEndpoint::from_uri_host(url.host_str())?;
     let port = url.port().unwrap_or(443);
     let credential = url.username();
     if credential.is_empty() {
@@ -79,7 +163,7 @@ fn parse_standard(input: &str, protocol: Protocol) -> Result<Server, String> {
     Ok(base_server(ServerInput {
         protocol,
         name,
-        address,
+        endpoint,
         port,
         transport: query.get("type").cloned(),
         credential: credential.to_owned(),
@@ -88,6 +172,21 @@ fn parse_standard(input: &str, protocol: Protocol) -> Result<Server, String> {
         vless_encryption,
         options: query,
     }))
+}
+
+fn standard_authority_error(input: &str) -> &'static str {
+    let authority = input
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
+        .unwrap_or_default();
+    if authority
+        .rsplit_once('@')
+        .is_some_and(|(_, host)| host.is_empty())
+    {
+        "MissingServerAddress"
+    } else {
+        "InvalidServerAddress"
+    }
 }
 fn parse_shadowsocks(input: &str) -> Result<Server, String> {
     let raw = input
@@ -107,13 +206,13 @@ fn parse_shadowsocks(input: &str) -> Result<Server, String> {
     };
     let url =
         Url::parse(&format!("ss://{}", decoded)).map_err(|_| "Некорректный Shadowsocks URI")?;
-    let address = url.host_str().ok_or("В URI отсутствует сервер")?.to_owned();
+    let endpoint = ServerEndpoint::from_uri_host(url.host_str())?;
     let port = url.port().ok_or("В URI отсутствует порт")?;
     let password = url.password().ok_or("В URI отсутствует пароль")?;
     Ok(base_server(ServerInput {
         protocol: Protocol::Shadowsocks,
         name: name.to_owned(),
-        address,
+        endpoint,
         port,
         transport: None,
         credential: format!("{}:{}", url.username(), password),
@@ -161,10 +260,11 @@ fn parse_vmess(input: &str) -> Result<Server, String> {
     if item.address.trim().is_empty() || item.id.trim().is_empty() {
         return Err("VMess-конфигурация неполная".into());
     }
+    let endpoint = ServerEndpoint::from_uri_host(Some(&item.address))?;
     Ok(base_server(ServerInput {
         protocol: Protocol::Vmess,
         name: item.name,
-        address: item.address,
+        endpoint,
         port,
         transport: (!item.transport.is_empty()).then_some(item.transport),
         credential: item.id,
@@ -180,7 +280,7 @@ mod tests {
     #[test]
     fn parses_vless_reality() {
         let item = parse_uri("vless://11111111-1111-1111-1111-111111111111@node.example:443?security=reality&type=grpc&sni=site.example#NL%20Edge").unwrap();
-        assert_eq!(item.summary.address, "node.example");
+        assert_eq!(item.endpoint.canonical(), "node.example");
         assert_eq!(item.summary.port, 443);
         assert_eq!(item.summary.name, "NL Edge");
         assert!(matches!(item.summary.protocol, Protocol::Vless));
@@ -190,7 +290,7 @@ mod tests {
     #[test]
     fn preserves_vless_tcp_reality_metadata_in_the_normalized_model() {
         let item = parse_uri("vless://11111111-1111-1111-1111-111111111111@198.51.100.7:8443?type=tcp&security=reality&flow=xtls-rprx-vision&sni=cover.example&pbk=fake-public-key&sid=aabb&fp=chrome&spx=%2Ffake-spider#Synthetic").unwrap();
-        assert_eq!(item.summary.address, "198.51.100.7");
+        assert_eq!(item.endpoint.canonical(), "198.51.100.7");
         assert_eq!(item.summary.port, 8443);
         assert_eq!(item.summary.transport.as_deref(), Some("tcp"));
         assert_eq!(item.security.as_deref(), Some("reality"));
@@ -225,6 +325,52 @@ mod tests {
             "mlkem768x25519plus/native/1rtt"
         );
         assert!(!item.options.contains_key("encryption"));
+    }
+
+    #[test]
+    fn authoritative_endpoint_preserves_domain_ipv4_and_ipv6_without_defaults() {
+        let domain =
+            parse_uri("vless://11111111-1111-1111-1111-111111111111@MiXeD.Example:443?type=tcp")
+                .unwrap();
+        assert!(matches!(domain.endpoint, ServerEndpoint::Domain(_)));
+        assert_eq!(domain.endpoint.canonical(), "mixed.example");
+
+        let ipv4 =
+            parse_uri("vless://11111111-1111-1111-1111-111111111111@198.51.100.7:443?type=tcp")
+                .unwrap();
+        assert!(matches!(ipv4.endpoint, ServerEndpoint::Ipv4(_)));
+
+        let ipv6 =
+            parse_uri("vless://11111111-1111-1111-1111-111111111111@[2001:db8::7]:443?type=tcp")
+                .unwrap();
+        assert!(matches!(ipv6.endpoint, ServerEndpoint::Ipv6(_)));
+    }
+
+    #[test]
+    fn rejects_missing_invalid_and_unspecified_vless_authorities() {
+        for input in [
+            "vless://11111111-1111-1111-1111-111111111111@:443?type=tcp",
+            "vless://11111111-1111-1111-1111-111111111111@bad_host:443?type=tcp",
+            "vless://11111111-1111-1111-1111-111111111111@0.0.0.0:443?type=tcp",
+            "vless://11111111-1111-1111-1111-111111111111@[::]:443?type=tcp",
+        ] {
+            let error = parse_uri(input).err().unwrap();
+            assert!(matches!(
+                error.as_str(),
+                "MissingServerAddress" | "InvalidServerAddress"
+            ));
+        }
+    }
+
+    #[test]
+    fn authority_observation_is_independent_from_query_parameters() {
+        let observation = inspect_uri_authority(
+            "vless://11111111-1111-1111-1111-111111111111@node.example:443?host=0.0.0.0&type=tcp",
+        );
+        assert!(observation.present);
+        assert_eq!(observation.kind, RawHostKind::Domain);
+        assert!(!observation.unspecified);
+        assert_eq!(observation.canonical.as_deref(), Some("node.example"));
     }
 
     #[test]

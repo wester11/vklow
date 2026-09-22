@@ -20,33 +20,45 @@ use void_desktop_lib::{
             physical_default_routes, physical_dns_snapshot, void_tun_adapters,
             PhysicalDnsComparison, PhysicalDnsSnapshot,
         },
-        secrets::WindowsSecretStore,
-        system_vpn::{compatibility_diagnostic, SystemVpnSessionSpec},
+        secrets::{subscription_url_key, SecretStore, WindowsSecretStore},
+        system_vpn::{
+            authoritative_endpoint_for_system_vpn, compatibility_diagnostic, SystemVpnSessionSpec,
+        },
         system_vpn_controller::SystemVpnController,
         tun::TunSessionJournal,
         xray::{config::FULL_IPV4_TUN_DNS, manager::XrayCoreManager},
     },
-    domain::{Protocol, Server},
-    subscription::import_https_subscription,
+    domain::{Protocol, Server, ServerEndpoint},
+    subscription::{
+        fetch_subscription_text, import_https_subscription, inspect_vless_endpoint_provenance,
+    },
 };
 use zeroize::Zeroize;
 
 const MAX_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 enum RunMode {
     ImportOnly,
     Phase2,
+    Provenance(String),
 }
 
 fn main() {
     let mode = match run_mode() {
         Some(mode) => mode,
         None => {
-            eprintln!("usage: void-dev-import-subscription [--phase2] < stdin");
+            eprintln!("usage: void-dev-import-subscription [--phase2] < stdin | --provenance <subscription-id>");
             process::exit(2);
         }
     };
+    if let RunMode::Provenance(subscription_id) = mode {
+        if let Err(error) = run_endpoint_provenance(&subscription_id) {
+            eprintln!("endpoint_provenance_failed stage={error}");
+            process::exit(1);
+        }
+        return;
+    }
     let mut source = match read_one_secret_line() {
         Ok(value) => value,
         Err(()) => {
@@ -118,7 +130,158 @@ fn run_mode() -> Option<RunMode> {
     match arguments.as_slice() {
         [] => Some(RunMode::ImportOnly),
         [argument] if argument == "--phase2" => Some(RunMode::Phase2),
+        [argument, subscription_id] if argument == "--provenance" => subscription_id
+            .to_str()
+            .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+            .map(|value| RunMode::Provenance(value.into())),
         _ => None,
+    }
+}
+
+fn run_endpoint_provenance(subscription_id: &str) -> Result<(), &'static str> {
+    let store = WindowsSecretStore::new();
+    let mut source = store
+        .get(&subscription_url_key(subscription_id))
+        .map_err(|_| "SecretStoreReadFailed")?
+        .ok_or("SubscriptionSourceUnavailable")?;
+    let mut body = tauri::async_runtime::block_on(fetch_subscription_text(&source))
+        .map_err(|_| "SubscriptionFetchFailed")?;
+    source.zeroize();
+    let mut key = diagnostic_key();
+    let mut entries = inspect_vless_endpoint_provenance(&body);
+    body.zeroize();
+    if entries.len() != 3 {
+        for entry in &mut entries {
+            entry.raw.canonical.as_mut().map(Zeroize::zeroize);
+            if let Ok(server) = &mut entry.parsed {
+                scrub_servers(std::slice::from_mut(server));
+            }
+        }
+        key.zeroize();
+        return Err("UnexpectedVlessEntryCount");
+    }
+    for (index, mut entry) in entries.drain(..).enumerate() {
+        let raw = safe_raw_stage(&entry.raw, &key);
+        entry.raw.canonical.as_mut().map(Zeroize::zeroize);
+        match entry.parsed {
+            Ok(mut server) => {
+                let parsed = safe_endpoint_stage(&server.endpoint, &key);
+                let normalized = safe_endpoint_stage(&server.endpoint, &key);
+                let reloaded = server
+                    .endpoint
+                    .persistence_round_trip()
+                    .map_err(|_| "EndpointPersistenceFailed")?;
+                let reloaded = safe_endpoint_stage(&reloaded, &key);
+                let system =
+                    safe_endpoint_stage(authoritative_endpoint_for_system_vpn(&server), &key);
+                let changed = first_changed(&[&raw, &parsed, &normalized, &reloaded, &system]);
+                println!(
+                    "server={} raw={} parsed={} normalized={} reloaded={} system_vpn={} first_changed={}",
+                    index + 1,
+                    raw,
+                    parsed,
+                    normalized,
+                    reloaded,
+                    system,
+                    changed,
+                );
+                scrub_servers(std::slice::from_mut(&mut server));
+            }
+            Err(error) => {
+                println!(
+                    "server={} raw={} parsed=invalid normalized=unavailable reloaded=unavailable system_vpn=unavailable first_changed=parser parse_error={}",
+                    index + 1,
+                    raw,
+                    safe_parse_error(&error),
+                );
+            }
+        }
+    }
+    key.zeroize();
+    println!("endpoint_provenance=complete secretstore=reused");
+    Ok(())
+}
+
+fn diagnostic_key() -> [u8; 32] {
+    let first = uuid::Uuid::new_v4();
+    let second = uuid::Uuid::new_v4();
+    let mut key = [0_u8; 32];
+    key[..16].copy_from_slice(first.as_bytes());
+    key[16..].copy_from_slice(second.as_bytes());
+    key
+}
+
+fn safe_raw_stage(
+    raw: &void_desktop_lib::subscription::parser::RawAuthorityObservation,
+    key: &[u8; 32],
+) -> String {
+    format!(
+        "present:{} kind:{} unspecified:{} fp:{}",
+        yes_no(raw.present),
+        raw.kind.code(),
+        yes_no(raw.unspecified),
+        fingerprint(raw.canonical.as_deref(), key),
+    )
+}
+
+fn safe_endpoint_stage(endpoint: &ServerEndpoint, key: &[u8; 32]) -> String {
+    format!(
+        "kind:{} unspecified:no fp:{}",
+        endpoint.kind().code(),
+        fingerprint(Some(&endpoint.canonical()), key),
+    )
+}
+
+fn fingerprint(value: Option<&str>, key: &[u8; 32]) -> String {
+    let Some(value) = value else {
+        return "none".into();
+    };
+    let mut inner = sha2::Sha256::new();
+    let mut pad = [0_u8; 64];
+    for (index, byte) in key.iter().enumerate() {
+        pad[index] = byte ^ 0x36;
+    }
+    inner.update(pad);
+    inner.update(value.as_bytes());
+    let inner = inner.finalize();
+    let mut outer = sha2::Sha256::new();
+    let mut pad = [0_u8; 64];
+    for (index, byte) in key.iter().enumerate() {
+        pad[index] = byte ^ 0x5c;
+    }
+    outer.update(pad);
+    outer.update(inner);
+    outer
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn first_changed(stages: &[&str]) -> &'static str {
+    let fingerprints = stages
+        .iter()
+        .filter_map(|stage| {
+            stage
+                .split("fp:")
+                .nth(1)
+                .and_then(|value| value.split_whitespace().next())
+        })
+        .collect::<Vec<_>>();
+    if fingerprints.len() == stages.len() && fingerprints.windows(2).all(|pair| pair[0] == pair[1])
+    {
+        "none"
+    } else {
+        "unavailable_or_changed"
+    }
+}
+
+fn safe_parse_error(error: &str) -> &'static str {
+    match error {
+        "MissingServerAddress" => "MissingServerAddress",
+        "InvalidServerAddress" => "InvalidServerAddress",
+        _ => "ParserRejectedEntry",
     }
 }
 
@@ -562,7 +725,9 @@ fn contains_secret(path: &Path, secret: &[u8]) -> Result<bool, ()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use void_desktop_lib::domain::{ServerHealth, ServerSummary, VlessEncryption};
+    use void_desktop_lib::domain::{
+        ServerEndpoint, ServerEndpointKind, ServerHealth, ServerSummary, VlessEncryption,
+    };
 
     #[test]
     fn safe_output_never_includes_server_address_or_credential() {
@@ -571,13 +736,14 @@ mod tests {
                 id: "safe-id".into(),
                 name: "Test node".into(),
                 protocol: Protocol::Vless,
-                address: "private-host.example".into(),
+                endpoint_kind: ServerEndpointKind::Domain,
                 port: 443,
                 transport: Some("tcp".into()),
                 country: None,
                 health: ServerHealth::Unknown,
                 latency_ms: None,
             },
+            endpoint: ServerEndpoint::Domain("private-host.example".into()),
             credential: "private-credential".into(),
             security: Some("reality".into()),
             sni: None,

@@ -1,5 +1,5 @@
 pub mod parser;
-use self::parser::parse_uri;
+use self::parser::{inspect_uri_authority, parse_uri, RawAuthorityObservation};
 use crate::{
     core::secrets::{subscription_url_key, SecretStore},
     domain::{Server, Subscription},
@@ -16,6 +16,13 @@ pub const MAX_SERVER_COUNT: usize = 500;
 pub struct ImportedSubscription {
     pub subscription: Subscription,
     pub servers: Vec<Server>,
+}
+
+/// Development-only consumers use this value-free/raw-authority split to
+/// trace a fetched VLESS entry without printing or persisting its URI.
+pub struct VlessEndpointProvenanceEntry {
+    pub raw: RawAuthorityObservation,
+    pub parsed: Result<Server, String>,
 }
 
 pub async fn import_https_subscription(
@@ -51,6 +58,18 @@ pub async fn fetch_and_parse(source: &str) -> Result<Vec<Server>, String> {
     if url.host_str().is_none() {
         return Err("В URL подписки отсутствует хост".into());
     }
+    let body = fetch_subscription_text(source).await?;
+    parse_subscription_text(&body)
+}
+
+pub async fn fetch_subscription_text(source: &str) -> Result<String, String> {
+    let url = Url::parse(source).map_err(|_| "Укажите корректный URL подписки")?;
+    if url.scheme() != "https" {
+        return Err("Подписка принимается только по HTTPS".into());
+    }
+    if url.host_str().is_none() {
+        return Err("В URL подписки отсутствует хост".into());
+    }
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .redirect(Policy::limited(3))
@@ -77,17 +96,29 @@ pub async fn fetch_and_parse(source: &str) -> Result<Vec<Server>, String> {
     if body.len() > MAX_RESPONSE_BYTES {
         return Err("Ответ подписки превышает допустимый размер".into());
     }
-    parse_subscription_text(&String::from_utf8_lossy(&body))
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 pub fn parse_subscription_text(body: &str) -> Result<Vec<Server>, String> {
     let content = decode_subscription(body).unwrap_or_else(|| body.trim().to_owned());
-    let servers: Vec<Server> = content
+    let mut servers = Vec::new();
+    for line in content
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .take(MAX_SERVER_COUNT + 1)
-        .filter_map(|line| parse_uri(line).ok())
-        .collect();
+    {
+        match parse_uri(line) {
+            Ok(server) => servers.push(server),
+            Err(error)
+                if line
+                    .get(..8)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("vless://")) =>
+            {
+                return Err(error);
+            }
+            Err(_) => {}
+        }
+    }
     if servers.len() > MAX_SERVER_COUNT {
         return Err("Подписка содержит слишком много серверов".into());
     }
@@ -95,6 +126,23 @@ pub fn parse_subscription_text(body: &str) -> Result<Vec<Server>, String> {
         return Err("В подписке не найдено поддерживаемых конфигураций".into());
     }
     Ok(servers)
+}
+
+pub fn inspect_vless_endpoint_provenance(body: &str) -> Vec<VlessEndpointProvenanceEntry> {
+    let content = decode_subscription(body).unwrap_or_else(|| body.trim().to_owned());
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.get(..8)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("vless://"))
+        })
+        .take(MAX_SERVER_COUNT)
+        .map(|line| VlessEndpointProvenanceEntry {
+            raw: inspect_uri_authority(line),
+            parsed: parse_uri(line),
+        })
+        .collect()
 }
 fn decode_subscription(body: &str) -> Option<String> {
     let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
@@ -106,4 +154,21 @@ fn decode_subscription(body: &str) -> Option<String> {
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .filter(|text| text.contains("://"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_vless_endpoint_aborts_import_without_a_connectable_server() {
+        assert_eq!(
+            parse_subscription_text(
+                "vless://11111111-1111-1111-1111-111111111111@0.0.0.0:443?type=tcp"
+            )
+            .err()
+            .as_deref(),
+            Some("InvalidServerAddress")
+        );
+    }
 }

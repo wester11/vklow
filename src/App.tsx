@@ -503,7 +503,7 @@ function ServerRow({
         <strong>{server.name}</strong>
         <span>
           {server.protocol.toUpperCase()} · {server.transport ?? "TCP"} ·{" "}
-          {server.address}
+          {server.endpointKind.toUpperCase()} endpoint
         </span>
       </div>
       <span className={`health ${server.health.toLowerCase()}`}>

@@ -22,7 +22,7 @@ export interface ServerSummary {
   id: string;
   name: string;
   protocol: Protocol;
-  address: string;
+  endpointKind: "domain" | "ipv4" | "ipv6";
   port: number;
   transport?: string;
   country?: string;
