@@ -178,6 +178,30 @@ mod tests {
         assert!(matches!(item.summary.protocol, Protocol::Vless));
         assert_eq!(item.options["security"], "reality");
     }
+
+    #[test]
+    fn preserves_vless_tcp_reality_metadata_in_the_normalized_model() {
+        let item = parse_uri("vless://11111111-1111-1111-1111-111111111111@198.51.100.7:8443?type=tcp&security=reality&flow=xtls-rprx-vision&sni=cover.example&pbk=fake-public-key&sid=aabb&fp=chrome&spx=%2Ffake-spider#Synthetic").unwrap();
+        assert_eq!(item.summary.address, "198.51.100.7");
+        assert_eq!(item.summary.port, 8443);
+        assert_eq!(item.summary.transport.as_deref(), Some("tcp"));
+        assert_eq!(item.security.as_deref(), Some("reality"));
+        assert_eq!(item.sni.as_deref(), Some("cover.example"));
+        assert_eq!(
+            item.options.get("flow").map(String::as_str),
+            Some("xtls-rprx-vision")
+        );
+        assert_eq!(
+            item.options.get("pbk").map(String::as_str),
+            Some("fake-public-key")
+        );
+        assert_eq!(item.options.get("sid").map(String::as_str), Some("aabb"));
+        assert_eq!(item.options.get("fp").map(String::as_str), Some("chrome"));
+        assert_eq!(
+            item.options.get("spx").map(String::as_str),
+            Some("/fake-spider")
+        );
+    }
     #[test]
     fn rejects_unknown_scheme() {
         assert!(parse_uri("file:///etc/passwd").is_err());

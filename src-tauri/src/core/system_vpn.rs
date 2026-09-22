@@ -22,6 +22,7 @@ pub enum SystemVpnRejectionReason {
     UnsupportedProtocol,
     UnsupportedTransport,
     UnsupportedSecurity,
+    PlainVlessRequiresTransportSecurity,
     UnsupportedFlow,
     MissingRealityPublicKey,
     MissingServerName,
@@ -37,6 +38,7 @@ impl SystemVpnRejectionReason {
             Self::UnsupportedProtocol => "UnsupportedProtocol",
             Self::UnsupportedTransport => "UnsupportedTransport",
             Self::UnsupportedSecurity => "UnsupportedSecurity",
+            Self::PlainVlessRequiresTransportSecurity => "PlainVlessRequiresTransportSecurity",
             Self::UnsupportedFlow => "UnsupportedFlow",
             Self::MissingRealityPublicKey => "MissingRealityPublicKey",
             Self::MissingServerName => "MissingServerName",
@@ -216,7 +218,13 @@ pub fn compatibility_for(server: &Server) -> SystemVpnCompatibility {
     if normalized_type(server.summary.transport.as_deref()) != "tcp" {
         return SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::UnsupportedTransport);
     }
-    if normalized_type(server.security.as_deref()) != "reality" {
+    let security = normalized_type(server.security.as_deref());
+    if security == "none" {
+        return SystemVpnCompatibility::Rejected(
+            SystemVpnRejectionReason::PlainVlessRequiresTransportSecurity,
+        );
+    }
+    if security != "reality" {
         return SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::UnsupportedSecurity);
     }
     if !matches!(
@@ -442,6 +450,18 @@ mod tests {
         assert_eq!(
             diagnostic.rejection_reason,
             Some(SystemVpnRejectionReason::UnsupportedSecurity)
+        );
+    }
+
+    #[test]
+    fn plain_vless_is_rejected_before_uac_or_config_generation() {
+        let mut server = fixture();
+        server.security = Some("none".into());
+        assert_eq!(
+            SystemVpnSessionSpec::from_selected_server(&server)
+                .err()
+                .unwrap(),
+            "PlainVlessRequiresTransportSecurity"
         );
     }
 }

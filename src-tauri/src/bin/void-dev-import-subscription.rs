@@ -123,7 +123,7 @@ fn run_mode() -> Option<RunMode> {
 }
 
 fn system_vpn_support(server: &Server) -> bool {
-    matches!(compatibility_diagnostic(server).rejection_reason, None)
+    compatibility_diagnostic(server).rejection_reason.is_none()
 }
 
 fn safe_compatibility_line(server: &Server) -> String {
