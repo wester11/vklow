@@ -21,7 +21,7 @@ use void_desktop_lib::{
             PhysicalDnsComparison, PhysicalDnsSnapshot,
         },
         secrets::WindowsSecretStore,
-        system_vpn::SystemVpnSessionSpec,
+        system_vpn::{compatibility_diagnostic, SystemVpnSessionSpec},
         system_vpn_controller::SystemVpnController,
         tun::TunSessionJournal,
         xray::{config::FULL_IPV4_TUN_DNS, manager::XrayCoreManager},
@@ -78,9 +78,9 @@ fn main() {
             );
             for server in &imported.servers {
                 println!(
-                    "{} system_vpn={}",
+                    "{} {}",
                     safe_server_line(server),
-                    system_vpn_support(server)
+                    safe_compatibility_line(server)
                 );
             }
             if mode == RunMode::Phase2 {
@@ -122,10 +122,37 @@ fn run_mode() -> Option<RunMode> {
     }
 }
 
-fn system_vpn_support(server: &Server) -> &'static str {
-    SystemVpnSessionSpec::from_selected_server(server)
-        .map(|_| "eligible")
-        .unwrap_or("unsupported")
+fn system_vpn_support(server: &Server) -> bool {
+    matches!(compatibility_diagnostic(server).rejection_reason, None)
+}
+
+fn safe_compatibility_line(server: &Server) -> String {
+    let diagnostic = compatibility_diagnostic(server);
+    let reason = diagnostic
+        .rejection_reason
+        .map(|reason| reason.code())
+        .unwrap_or("None");
+    format!(
+        "security_type={} flow_type={} sni_present={} reality_public_key_present={} short_id_present={} fingerprint_present={} spider_x_present={} address_kind={} compatibility={} rejection_reason={}",
+        diagnostic.security_type,
+        diagnostic.flow_type,
+        yes_no(diagnostic.sni_present),
+        yes_no(diagnostic.reality_public_key_present),
+        yes_no(diagnostic.short_id_present),
+        yes_no(diagnostic.fingerprint_present),
+        yes_no(diagnostic.spider_x_present),
+        diagnostic.address_kind,
+        diagnostic.compatibility,
+        reason,
+    )
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn scrub_servers(servers: &mut [Server]) {
@@ -145,7 +172,7 @@ fn scrub_servers(servers: &mut [Server]) {
 fn select_development_phase2_server(servers: &[Server]) -> Result<&Server, &'static str> {
     servers
         .iter()
-        .find(|server| system_vpn_support(server) == "eligible")
+        .find(|server| system_vpn_support(server))
         .ok_or("NoSupportedServerForSystemVpn")
 }
 

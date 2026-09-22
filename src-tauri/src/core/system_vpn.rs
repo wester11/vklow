@@ -8,10 +8,69 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::net::IpAddr;
 use uuid::Uuid;
 
 pub const SYSTEM_VPN_SPEC_VERSION: u8 = 1;
 pub const PINNED_EXPERIMENTAL_TUN_VERSION: &str = "v26.9.8";
+
+/// A deliberately value-free explanation of why an imported normalized server
+/// cannot enter the privileged System VPN flow.  These identifiers are safe to
+/// surface in diagnostics; no URI field or credential is ever included.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum SystemVpnRejectionReason {
+    UnsupportedProtocol,
+    UnsupportedTransport,
+    UnsupportedSecurity,
+    UnsupportedFlow,
+    MissingRealityPublicKey,
+    MissingServerName,
+    MissingFingerprint,
+    InvalidShortId,
+    ParserDroppedRealityMetadata,
+    UnsupportedNormalizedVariant,
+}
+
+impl SystemVpnRejectionReason {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::UnsupportedProtocol => "UnsupportedProtocol",
+            Self::UnsupportedTransport => "UnsupportedTransport",
+            Self::UnsupportedSecurity => "UnsupportedSecurity",
+            Self::UnsupportedFlow => "UnsupportedFlow",
+            Self::MissingRealityPublicKey => "MissingRealityPublicKey",
+            Self::MissingServerName => "MissingServerName",
+            Self::MissingFingerprint => "MissingFingerprint",
+            Self::InvalidShortId => "InvalidShortId",
+            Self::ParserDroppedRealityMetadata => "ParserDroppedRealityMetadata",
+            Self::UnsupportedNormalizedVariant => "UnsupportedNormalizedVariant",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemVpnCompatibility {
+    Eligible,
+    Rejected(SystemVpnRejectionReason),
+}
+
+/// A safe compatibility record for development diagnostics.  Type fields are
+/// constrained labels, while credential-bearing values remain private.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SafeSystemVpnCompatibilityDiagnostic {
+    pub protocol: &'static str,
+    pub transport: &'static str,
+    pub security_type: &'static str,
+    pub flow_type: &'static str,
+    pub sni_present: bool,
+    pub reality_public_key_present: bool,
+    pub short_id_present: bool,
+    pub fingerprint_present: bool,
+    pub spider_x_present: bool,
+    pub address_kind: &'static str,
+    pub compatibility: &'static str,
+    pub rejection_reason: Option<SystemVpnRejectionReason>,
+}
 
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -150,11 +209,81 @@ impl SystemVpnSessionSpec {
     }
 }
 
-pub fn outbound_from_server(server: &Server) -> Result<VlessRealityOutbound, String> {
-    if !matches!(server.summary.protocol, Protocol::Vless)
-        || server.security.as_deref() != Some("reality")
+pub fn compatibility_for(server: &Server) -> SystemVpnCompatibility {
+    if !matches!(server.summary.protocol, Protocol::Vless) {
+        return SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::UnsupportedProtocol);
+    }
+    if normalized_type(server.summary.transport.as_deref()) != "tcp" {
+        return SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::UnsupportedTransport);
+    }
+    if normalized_type(server.security.as_deref()) != "reality" {
+        return SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::UnsupportedSecurity);
+    }
+    if !matches!(
+        flow_type(server.options.get("flow").map(String::as_str)),
+        "empty" | "xtls-rprx-vision" | "xtls-rprx-vision-udp443"
+    ) {
+        return SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::UnsupportedFlow);
+    }
+    if !has_nonempty(server.sni.as_deref())
+        .or_else(|| has_nonempty(server.options.get("sni").map(String::as_str)))
+        .unwrap_or(false)
     {
-        return Err("UnsupportedServerForSystemVpn".into());
+        return SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::MissingServerName);
+    }
+    if !has_nonempty(server.options.get("pbk").map(String::as_str)).unwrap_or(false) {
+        return SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::MissingRealityPublicKey);
+    }
+    if !has_nonempty(server.options.get("fp").map(String::as_str)).unwrap_or(false) {
+        return SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::MissingFingerprint);
+    }
+    if let Some(short_id) = server.options.get("sid") {
+        if !valid_short_id(short_id) {
+            return SystemVpnCompatibility::Rejected(SystemVpnRejectionReason::InvalidShortId);
+        }
+    }
+    SystemVpnCompatibility::Eligible
+}
+
+pub fn compatibility_diagnostic(server: &Server) -> SafeSystemVpnCompatibilityDiagnostic {
+    let compatibility = compatibility_for(server);
+    let rejection_reason = match compatibility {
+        SystemVpnCompatibility::Eligible => None,
+        SystemVpnCompatibility::Rejected(reason) => Some(reason),
+    };
+    SafeSystemVpnCompatibilityDiagnostic {
+        protocol: protocol_type(server.summary.protocol),
+        transport: normalized_type(server.summary.transport.as_deref()),
+        security_type: normalized_type(server.security.as_deref()),
+        flow_type: flow_type(server.options.get("flow").map(String::as_str)),
+        sni_present: has_nonempty(server.sni.as_deref())
+            .or_else(|| has_nonempty(server.options.get("sni").map(String::as_str)))
+            .unwrap_or(false),
+        reality_public_key_present: has_nonempty(server.options.get("pbk").map(String::as_str))
+            .unwrap_or(false),
+        short_id_present: has_nonempty(server.options.get("sid").map(String::as_str))
+            .unwrap_or(false),
+        fingerprint_present: has_nonempty(server.options.get("fp").map(String::as_str))
+            .unwrap_or(false),
+        spider_x_present: has_nonempty(server.options.get("spx").map(String::as_str))
+            .unwrap_or(false),
+        address_kind: if server.summary.address.parse::<IpAddr>().is_ok() {
+            "ip"
+        } else {
+            "domain"
+        },
+        compatibility: if rejection_reason.is_some() {
+            "rejected"
+        } else {
+            "eligible"
+        },
+        rejection_reason,
+    }
+}
+
+pub fn outbound_from_server(server: &Server) -> Result<VlessRealityOutbound, String> {
+    if let SystemVpnCompatibility::Rejected(reason) = compatibility_for(server) {
+        return Err(reason.code().into());
     }
     let option = |key| server.options.get(key).cloned().unwrap_or_default();
     Ok(VlessRealityOutbound {
@@ -167,6 +296,47 @@ pub fn outbound_from_server(server: &Server) -> Result<VlessRealityOutbound, Str
         public_key: option("pbk"),
         short_id: option("sid"),
     })
+}
+
+fn protocol_type(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Vless => "vless",
+        Protocol::Vmess => "vmess",
+        Protocol::Shadowsocks => "shadowsocks",
+        Protocol::Trojan => "trojan",
+    }
+}
+
+fn normalized_type(value: Option<&str>) -> &'static str {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("tcp") | Some("raw") => "tcp",
+        Some("reality") => "reality",
+        Some("tls") => "tls",
+        Some("none") => "none",
+        Some("grpc") => "grpc",
+        Some("ws") | Some("websocket") => "websocket",
+        Some("") | None => "empty",
+        Some(_) => "other",
+    }
+}
+
+fn flow_type(value: Option<&str>) -> &'static str {
+    match value.map(str::trim) {
+        None | Some("") => "empty",
+        Some("xtls-rprx-vision") => "xtls-rprx-vision",
+        Some("xtls-rprx-vision-udp443") => "xtls-rprx-vision-udp443",
+        Some(_) => "other",
+    }
+}
+
+fn has_nonempty(value: Option<&str>) -> Option<bool> {
+    value.map(|value| !value.trim().is_empty())
+}
+
+fn valid_short_id(value: &str) -> bool {
+    value.len() <= 16
+        && value.len().is_multiple_of(2)
+        && value.bytes().all(|character| character.is_ascii_hexdigit())
 }
 
 fn validate_text(value: &str, limit: usize, error: &'static str) -> Result<(), String> {
@@ -244,7 +414,34 @@ mod tests {
             SystemVpnSessionSpec::from_selected_server(&server)
                 .err()
                 .unwrap(),
-            "UnsupportedServerForSystemVpn"
+            "UnsupportedProtocol"
+        );
+    }
+
+    #[test]
+    fn diagnosis_is_value_free_and_allows_empty_reality_flow() {
+        let mut server = fixture();
+        server.options.insert("flow".into(), String::new());
+        server.options.insert("spx".into(), "/fake-path".into());
+        let diagnostic = compatibility_diagnostic(&server);
+        assert_eq!(diagnostic.protocol, "vless");
+        assert_eq!(diagnostic.transport, "tcp");
+        assert_eq!(diagnostic.security_type, "reality");
+        assert_eq!(diagnostic.flow_type, "empty");
+        assert!(diagnostic.spider_x_present);
+        assert_eq!(diagnostic.compatibility, "eligible");
+        assert_eq!(diagnostic.rejection_reason, None);
+    }
+
+    #[test]
+    fn tls_is_reported_as_a_specific_unsupported_security_variant() {
+        let mut server = fixture();
+        server.security = Some("tls".into());
+        let diagnostic = compatibility_diagnostic(&server);
+        assert_eq!(diagnostic.security_type, "tls");
+        assert_eq!(
+            diagnostic.rejection_reason,
+            Some(SystemVpnRejectionReason::UnsupportedSecurity)
         );
     }
 }
